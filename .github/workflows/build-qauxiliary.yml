@@ -1,0 +1,146 @@
+name: Build QAuxiliary APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build APK Artifacts
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_BASEDIR: "${{ github.workspace }}"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+          fetch-depth: 0
+
+      - name: Configure submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C "libs/LSPlant" config "submodule.test/src/main/jni/external/lsprism.update" none
+          git -C "libs/LSPlant" config "submodule.test/src/main/jni/external/lsparself.update" none
+          git -C "libs/LSPlant" config "submodule.docs/doxygen-awesome-css.update" none
+          git -C "libs/mmkv/MMKV" config "submodule.Python/pybind11.update" none
+          git submodule foreach git submodule update --init --recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: gradle
+
+      - name: Install ninja-build and ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+          ccache -o max_size=1G
+          ccache -o hash_dir=false
+          ccache -o hard_link=true
+          ccache -o compiler_check='%compiler% -dumpmachine; %compiler% -dumpversion'
+          ccache -zp
+
+      - name: Setup Android SDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+          mkdir -p "$ANDROID_HOME/licenses"
+          : > "$ANDROID_HOME/licenses/android-sdk-license"
+          echo -n "24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.31.0"
+          {
+            echo "sdk.dir=${ANDROID_HOME}"
+            echo "qauxv.override.ninja.path=/usr/bin/ninja"
+          } > local.properties
+
+      - name: Prepare signing keystore (secrets or temporary)
+        shell: bash
+        env:
+          SIGN_KEYSTORE_BASE64: ${{ secrets.SIGN_KEYSTORE_BASE64 }}
+          SIGN_KEYSTORE_PASSWORD: ${{ secrets.SIGN_KEYSTORE_PASSWORD }}
+          SIGN_ALIAS: ${{ secrets.SIGN_ALIAS }}
+          SIGN_KEY_PASSWORD: ${{ secrets.SIGN_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SIGN_KEYSTORE_BASE64:-}" && -n "${SIGN_KEYSTORE_PASSWORD:-}" && -n "${SIGN_ALIAS:-}" && -n "${SIGN_KEY_PASSWORD:-}" ]]; then
+            echo "${SIGN_KEYSTORE_BASE64}" | base64 -d > keystore.jks
+            echo "KEYSTORE_PASSWORD=${SIGN_KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=${SIGN_ALIAS}" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=${SIGN_KEY_PASSWORD}" >> "$GITHUB_ENV"
+            echo "SIGNING_MODE=secrets" >> "$GITHUB_ENV"
+          else
+            STORE_PASS="$(openssl rand -hex 16)"
+            KEY_PASS="$(openssl rand -hex 16)"
+            ALIAS_NAME="qauxv_ci"
+            keytool -genkeypair \
+              -alias "${ALIAS_NAME}" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 36500 \
+              -keystore keystore.jks \
+              -storepass "${STORE_PASS}" \
+              -keypass "${KEY_PASS}" \
+              -dname "CN=QAuxiliary CI,O=QAuxiliary,C=US" \
+              -noprompt
+            echo "KEYSTORE_PASSWORD=${STORE_PASS}" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=${ALIAS_NAME}" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=${KEY_PASS}" >> "$GITHUB_ENV"
+            echo "SIGNING_MODE=temp" >> "$GITHUB_ENV"
+          fi
+          echo "KEYSTORE_PATH=../keystore.jks" >> "$GITHUB_ENV"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build with Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "org.gradle.parallel=true" >> gradle.properties
+          echo "org.gradle.vfs.watch=true" >> gradle.properties
+          sed -i 's/org.gradle.configuration-cache=true//g' gradle.properties || true
+          ./gradlew :app:synthesizeDistReleaseApksCI :app:extractReleaseNativeDebugMetadata --no-daemon
+          ccache -s
+        env:
+          KEYSTORE_PATH: ${{ env.KEYSTORE_PATH }}
+          KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ env.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ env.KEY_PASSWORD }}
+          QAUXV_OVERRIDE_CMAKE_VERSION: "3.31.0"
+
+      - name: Collect APK artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-artifacts
+          cp app/build/outputs/ci/*.apk build-artifacts/
+          if ! compgen -G "build-artifacts/*.apk" > /dev/null; then
+            echo "No APK files found under app/build/outputs/ci/"
+            exit 1
+          fi
+          (
+            cd build-artifacts
+            sha256sum *.apk > SHA256SUMS.txt
+          )
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: QAuxiliary-custom-apks
+          path: build-artifacts/
+          if-no-files-found: error
