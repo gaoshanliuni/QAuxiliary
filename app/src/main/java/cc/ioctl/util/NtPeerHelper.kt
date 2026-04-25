@@ -62,12 +62,14 @@ object NtPeerHelper {
 
     private val fieldPriority = arrayOf(
         "peerId", "mPeerId", "uid", "mUid", "uin", "mUin", "friendUin", "mFriendUin", "targetUin",
+        "tinyId", "mTinyId", "uidString", "mUidString", "contactUin", "mContactUin", "userId", "mUserId",
         "contact", "mContact", "aioContact", "mAioContact", "session", "mSession",
         "profile", "mProfile", "relation", "mRelation"
     )
 
     private val getterPriority = arrayOf(
         "getPeerId", "getUid", "getUin", "getFriendUin", "getFriendUid",
+        "getTinyId", "getUidString", "getContactUin", "getUserId",
         "getContact", "getAioContact", "getSession", "getProfile", "getRelation"
     )
 
@@ -215,7 +217,15 @@ object NtPeerHelper {
 
     fun isFeatureEnabled(): Boolean {
         val cfg = ConfigManager.getDefaultConfig()
-        return cfg.getBooleanOrDefault(KEY_ENABLED, false) || cfg.getBooleanOrDefault(KEY_ENABLED_LEGACY, false)
+        val hasNew = cfg.containsKey(KEY_ENABLED)
+        val hasLegacy = cfg.containsKey(KEY_ENABLED_LEGACY)
+        if (hasNew) {
+            return cfg.getBooleanOrDefault(KEY_ENABLED, true)
+        }
+        if (hasLegacy) {
+            return cfg.getBooleanOrDefault(KEY_ENABLED_LEGACY, true)
+        }
+        return true
     }
 
     fun isDebugEnabled(): Boolean {
@@ -407,6 +417,8 @@ object NtPeerHelper {
         if (value.isNullOrEmpty()) return false
         if (value.startsWith("u_", ignoreCase = true) && value.length in 8..40) return true
         return value.startsWith("uid_", ignoreCase = true)
+            || (value.length in 8..64 && value.contains('_') && value.any { it.isLetter() })
+            || (value.length in 8..64 && value.any { it.isLetter() } && value.any { it.isDigit() })
     }
 
     private fun buildTargetSignature(targetPeer: String?, targetUin: String?): String {

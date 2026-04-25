@@ -38,6 +38,7 @@ import androidx.appcompat.widget.AppCompatTextView
 import androidx.appcompat.widget.SwitchCompat
 import androidx.recyclerview.widget.RecyclerView
 import cc.hicore.QApp.QAppUtils
+import cc.ioctl.util.HostInfo
 import cc.ioctl.util.LayoutHelper
 import cc.ioctl.util.NtPeerHelper
 import cc.ioctl.util.hookAfterIfEnabled
@@ -52,6 +53,7 @@ import io.github.qauxv.hook.CommonConfigFunctionHook
 import io.github.qauxv.ui.CommonContextWrapper
 import io.github.qauxv.util.Initiator
 import io.github.qauxv.util.Log
+import io.github.qauxv.util.SyncUtils
 import io.github.qauxv.util.Toasts
 import io.github.qauxv.util.dexkit.DexKit
 import io.github.qauxv.util.dexkit.DexKitTarget
@@ -110,7 +112,7 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
 
     private const val DAY_MILLIS = 24L * 60 * 60 * 1000
     private const val DEFAULT_TARGET_UIN = "3394944898"
-    private const val DEFAULT_FAKE_ADD_DATE = "2023-01-01"
+    private const val DEFAULT_FAKE_ADD_DATE = "2023-01-02"
     private const val DEFAULT_DEBUG_SERVER_URL = "http://192.168.50.60:8848"
 
     private const val HOOK_INSTALLED_INTIMATE_HEADER = "intimateHeaderHookInstalled"
@@ -124,16 +126,25 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     private const val HOOK_INSTALLED_FRIEND_CLUE_JSBRIDGE = "friendClueJsBridgeHookInstalled"
     private const val HOOK_INSTALLED_FRIEND_CLUE_DOM = "friendClueDomHookInstalled"
 
-    private const val HOOK_HIT_INTIMATE_HEADER = "intimateHeaderHookHitCount"
-    private const val HOOK_HIT_INTIMATE_DAYS_COMPUTE = "intimateDaysComputeHookHitCount"
-    private const val HOOK_HIT_RELATION_DAY_BIND = "relationshipDayTextBindHitCount"
+    private const val HOOK_HIT_INTIMATE_HEADER = "intimateHeaderHitCount"
+    private const val HOOK_HIT_INTIMATE_DAYS_COMPUTE = "daysComputeHitCount"
+    private const val HOOK_HIT_RELATION_DAY_BIND = "relationshipBindHitCount"
     private const val HOOK_HIT_BECOME_FRIEND_BIND = "becomeFriendDaysBindHitCount"
-    private const val HOOK_HIT_MEMORY_TIMELINE = "memoryTimelineHookHitCount"
-    private const val HOOK_HIT_DNA_BIND = "dnaBindHookHitCount"
+    private const val HOOK_HIT_MEMORY_TIMELINE = "memoryTimelineHitCount"
+    private const val HOOK_HIT_DNA_BIND = "dnaBindHitCount"
     private const val HOOK_HIT_FRIEND_CLUE_ENTRY = "friendClueEntryHitCount"
     private const val HOOK_HIT_FRIEND_CLUE_WEBVIEW = "friendClueWebViewHitCount"
     private const val HOOK_HIT_FRIEND_CLUE_JSBRIDGE = "friendClueJsBridgeHitCount"
     private const val HOOK_HIT_FRIEND_CLUE_DOM = "friendClueDomFallbackHitCount"
+
+    private const val COUNTER_INIT_CALLED = "initCalled"
+    private const val COUNTER_DEX_RESOLVE_SUCCESS = "dexTargetResolveSuccessCount"
+    private const val COUNTER_DEX_RESOLVE_FAILED = "dexTargetResolveFailedCount"
+    private const val COUNTER_HOOK_INSTALL_SUCCESS = "hookInstallSuccessCount"
+    private const val COUNTER_HOOK_INSTALL_FAILED = "hookInstallFailedCount"
+    private const val COUNTER_TARGET_MATCHED = "targetMatchedCount"
+    private const val COUNTER_REWRITE_SUCCESS = "rewriteSuccessCount"
+    private const val COUNTER_REWRITE_SKIPPED = "rewriteSkippedCount"
 
     private val dateKeywordList = arrayOf(
         "成为好友", "添加好友", "好友添加", "添加时间", "加好友", "加为好友", "已成为好友", "已绑定", "友谊时间线", "DNA"
@@ -154,6 +165,12 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     @Volatile
     private var mInitReadyForDebugChannel: Boolean = false
 
+    @Volatile
+    private var mLastError: String = "-"
+
+    @Volatile
+    private var mStartupDiagLogged = false
+
     private val mHookInstalledState = ConcurrentHashMap<String, Boolean>(16)
     private val mHookHitCounters = ConcurrentHashMap<String, AtomicLong>(32)
 
@@ -165,9 +182,21 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     }
 
     override fun initOnce(): Boolean {
+        increaseCounter(COUNTER_INIT_CALLED)
+        Log.d("FakeFriendAddDateNt initOnce called")
+        refreshDebugTransportState()
+        printStartupDiagnostics()
         if (!QAppUtils.isQQnt()) {
             mInitReadyForDebugChannel = false
             refreshDebugTransportState()
+            reportHookEvent(
+                event = "init_skipped_non_nt",
+                hookPoint = "initOnce",
+                page = "startup",
+                strategy = "guard",
+                targetMatched = false,
+                message = "skip install because host is not QQNT"
+            )
             return true
         }
         installHeaderModelHook()
@@ -182,11 +211,13 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         installFriendCluePageFinishedHook()
         mInitReadyForDebugChannel = true
         refreshDebugTransportState()
+        printStartupDiagnostics()
         return true
     }
 
     private fun installHeaderModelHook() {
         val method = resolveHookMethod(
+            hookTag = "intimate_header_model",
             target = NT_Profile_AddFriendDate_Bind,
             fallbackClassNames = arrayOf("com.tencent.mobileqq.activity.aio.intimate.header.f")
         ) { m ->
@@ -201,11 +232,15 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                 if (!isRuntimeReady() || !isProfilePageEnabled()) return@runCatching
                 val rule = resolveRuntimeRule() ?: return@runCatching
                 val thisObj = param.thisObject ?: return@runCatching
-                if (!isTargetContext(thisObj, *param.args)) return@runCatching
+                if (!isTargetContext(thisObj, *param.args)) {
+                    logTargetMismatch("intimate_header", hookPointOf(method), thisObj, *param.args)
+                    return@runCatching
+                }
+                increaseCounter(COUNTER_TARGET_MATCHED)
+                markHookHit(HOOK_HIT_INTIMATE_HEADER)
                 val model = param.args.getOrNull(0) ?: return@runCatching
                 val patchedModel = rebuildHeaderModel(model, rule.days) ?: return@runCatching
                 param.args[0] = patchedModel
-                markHookHit(HOOK_HIT_INTIMATE_HEADER)
                 reportHookEvent(
                     event = "intimate_header_model_rewrite",
                     hookPoint = hookPointOf(method),
@@ -214,15 +249,17 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                     targetMatched = true,
                     message = "hit intimate relation bind hook",
                     rule = rule,
-                    extras = mapOf("calculatedDays" to rule.days)
+                    extras = mapOf("calculatedDays" to rule.days),
+                    rewriteChanged = true
                 )
                 debugLog("hook header model: class=${thisObj.javaClass.name}, days=${rule.days}")
-            }.onFailure { traceError(it) }
+            }.onFailure { onHookError("hook/intimate_header_model", it) }
         }
     }
 
     private fun installRelationDaysCalcHook() {
         val method = resolveHookMethod(
+            hookTag = "intimate_days_compute",
             target = NT_Profile_RelationInfo_Bind,
             fallbackClassNames = arrayOf("vx.o")
         ) { m ->
@@ -239,11 +276,15 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                 val type = param.args.getOrNull(0) as? Int ?: return@runCatching
                 if (type != 0) return@runCatching
                 val thisObj = param.thisObject ?: return@runCatching
-                if (!isTargetContext(thisObj, *param.args)) return@runCatching
+                if (!isTargetContext(thisObj, *param.args)) {
+                    logTargetMismatch("intimate_relation", hookPointOf(method), thisObj, *param.args)
+                    return@runCatching
+                }
+                increaseCounter(COUNTER_TARGET_MATCHED)
+                markHookHit(HOOK_HIT_INTIMATE_DAYS_COMPUTE)
                 val rule = resolveRuntimeRule() ?: return@runCatching
                 param.result = rule.days
                 setIntFieldIfPresent(thisObj, arrayOf("mIntimateRealDays", "intimateRealDays"), rule.days)
-                markHookHit(HOOK_HIT_INTIMATE_DAYS_COMPUTE)
                 reportHookEvent(
                     event = "intimate_days_compute_override",
                     hookPoint = hookPointOf(method),
@@ -252,15 +293,17 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                     targetMatched = true,
                     message = "override become-friend days result",
                     rule = rule,
-                    extras = mapOf("calculatedDays" to rule.days)
+                    extras = mapOf("calculatedDays" to rule.days),
+                    rewriteChanged = true
                 )
                 debugLog("hook relation days calc: class=${thisObj.javaClass.name}, days=${rule.days}")
-            }.onFailure { traceError(it) }
+            }.onFailure { onHookError("hook/intimate_days_compute", it) }
         }
     }
 
     private fun installRelationRenderHook() {
         val method = resolveHookMethod(
+            hookTag = "relationship_day_bind",
             target = NT_Profile_RelationInfo_Bind,
             fallbackClassNames = arrayOf("vx.o")
         ) { m ->
@@ -275,14 +318,18 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
             runCatching {
                 if (!isRuntimeReady() || !isChatSettingPageEnabled()) return@runCatching
                 val thisObj = param.thisObject ?: return@runCatching
-                if (!isTargetContext(thisObj, *param.args)) return@runCatching
+                if (!isTargetContext(thisObj, *param.args)) {
+                    logTargetMismatch("intimate_relation", hookPointOf(method), thisObj, *param.args)
+                    return@runCatching
+                }
+                increaseCounter(COUNTER_TARGET_MATCHED)
+                markHookHit(HOOK_HIT_RELATION_DAY_BIND)
                 val rule = resolveRuntimeRule() ?: return@runCatching
                 val dayView = getFieldValue(thisObj, arrayOf("mTvRelationshipDay"), TextView::class.java) ?: return@runCatching
                 val oldText = dayView.text?.toString().orEmpty()
                 val newText = replaceFriendTimeText(oldText, rule)
                 if (newText != oldText) {
                     dayView.text = newText
-                    markHookHit(HOOK_HIT_RELATION_DAY_BIND)
                     reportHookEvent(
                         event = "relationship_day_text_bind",
                         hookPoint = hookPointOf(method),
@@ -295,16 +342,20 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                             "originalTextMasked" to maskTextForReport(oldText),
                             "newText" to newText,
                             "calculatedDays" to rule.days
-                        )
+                        ),
+                        rewriteChanged = true
                     )
                     debugLog("hook relation render: text=$newText")
+                } else {
+                    markRewriteResult(false)
                 }
-            }.onFailure { traceError(it) }
+            }.onFailure { onHookError("hook/relationship_day_bind", it) }
         }
     }
 
     private fun installUnbindCardHook() {
         val method = resolveHookMethod(
+            hookTag = "become_friend_bind",
             target = NT_Profile_UnbindAddDate_Bind,
             fallbackClassNames = arrayOf("vx.w")
         ) { m ->
@@ -319,14 +370,18 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
             runCatching {
                 if (!isRuntimeReady() || !isChatSettingPageEnabled()) return@runCatching
                 val thisObj = param.thisObject ?: return@runCatching
-                if (!isTargetContext(thisObj, *param.args)) return@runCatching
+                if (!isTargetContext(thisObj, *param.args)) {
+                    logTargetMismatch("chat_setting", hookPointOf(method), thisObj, *param.args)
+                    return@runCatching
+                }
+                increaseCounter(COUNTER_TARGET_MATCHED)
+                markHookHit(HOOK_HIT_BECOME_FRIEND_BIND)
                 val rule = resolveRuntimeRule() ?: return@runCatching
                 val dayView = getFieldValue(thisObj, arrayOf("mBecomeFriendDays"), TextView::class.java) ?: return@runCatching
                 val oldText = dayView.text?.toString().orEmpty()
                 val targetText = rule.days.toString()
                 if (oldText != targetText) {
                     dayView.text = targetText
-                    markHookHit(HOOK_HIT_BECOME_FRIEND_BIND)
                     reportHookEvent(
                         event = "become_friend_days_bind",
                         hookPoint = hookPointOf(method),
@@ -339,16 +394,20 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                             "originalTextMasked" to maskTextForReport(oldText),
                             "newText" to targetText,
                             "calculatedDays" to rule.days
-                        )
+                        ),
+                        rewriteChanged = true
                     )
                     debugLog("hook unbind card days: $targetText")
+                } else {
+                    markRewriteResult(false)
                 }
-            }.onFailure { traceError(it) }
+            }.onFailure { onHookError("hook/become_friend_bind", it) }
         }
     }
 
     private fun installMemoryDayHook() {
         val method = resolveHookMethod(
+            hookTag = "memory_timeline_bind",
             target = NT_Profile_MemoryDay_Helper,
             fallbackClassNames = arrayOf("com.tencent.mobileqq.activity.aio.intimate.k")
         ) { m ->
@@ -364,12 +423,16 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                 if (!isRuntimeReady() || !isProfilePageEnabled()) return@runCatching
                 val thisObj = param.thisObject ?: return@runCatching
                 val listArg = param.args.getOrNull(1) as? MutableList<Any> ?: return@runCatching
-                if (!isTargetContext(thisObj, *param.args)) return@runCatching
+                if (!isTargetContext(thisObj, *param.args)) {
+                    logTargetMismatch("friend_timeline", hookPointOf(method), thisObj, *param.args)
+                    return@runCatching
+                }
+                increaseCounter(COUNTER_TARGET_MATCHED)
+                markHookHit(HOOK_HIT_MEMORY_TIMELINE)
                 val rule = resolveRuntimeRule() ?: return@runCatching
                 for (item in listArg) {
                     patchMemoryDayItem(item, rule)
                 }
-                markHookHit(HOOK_HIT_MEMORY_TIMELINE)
                 reportHookEvent(
                     event = "memory_timeline_rewrite",
                     hookPoint = hookPointOf(method),
@@ -378,15 +441,17 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                     targetMatched = true,
                     message = "rewrite memory timeline day models",
                     rule = rule,
-                    extras = mapOf("itemCount" to listArg.size, "calculatedDays" to rule.days)
+                    extras = mapOf("itemCount" to listArg.size, "calculatedDays" to rule.days),
+                    rewriteChanged = true
                 )
                 debugLog("hook memory day list: size=${listArg.size}")
-            }.onFailure { traceError(it) }
+            }.onFailure { onHookError("hook/memory_timeline_bind", it) }
         }
     }
 
     private fun installDnaItemBindHook() {
         val method = resolveHookMethod(
+            hookTag = "dna_item_bind",
             target = NT_Profile_NewDna_Adapter,
             fallbackClassNames = arrayOf("com.tencent.mobileqq.activity.aio.intimate.view.IntimateContentItemNewDnaView\$c")
         ) { m ->
@@ -403,10 +468,14 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                 if (!isRuntimeReady() || !isProfilePageEnabled()) return@runCatching
                 val adapterObj = param.thisObject ?: return@runCatching
                 val holder = param.args.getOrNull(0) ?: return@runCatching
-                if (!isTargetContext(adapterObj, holder, *param.args)) return@runCatching
+                if (!isTargetContext(adapterObj, holder, *param.args)) {
+                    logTargetMismatch("dna_timeline", hookPointOf(method), adapterObj, holder, *param.args)
+                    return@runCatching
+                }
+                increaseCounter(COUNTER_TARGET_MATCHED)
+                markHookHit(HOOK_HIT_DNA_BIND)
                 val rule = resolveRuntimeRule() ?: return@runCatching
                 patchDnaViewHolder(holder, rule)
-                markHookHit(HOOK_HIT_DNA_BIND)
                 reportHookEvent(
                     event = "dna_item_bind_rewrite",
                     hookPoint = hookPointOf(method),
@@ -414,14 +483,16 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                     strategy = "bind_layer",
                     targetMatched = true,
                     message = "rewrite dna card bind text",
-                    rule = rule
+                    rule = rule,
+                    rewriteChanged = true
                 )
-            }.onFailure { traceError(it) }
+            }.onFailure { onHookError("hook/dna_item_bind", it) }
         }
     }
 
     private fun installFriendClueEntryHook() {
         val method = resolveHookMethod(
+            hookTag = "friend_clue_entry",
             target = null,
             fallbackClassNames = arrayOf("com.tencent.mobileqq.relationx.friendclue.c")
         ) { m ->
@@ -475,9 +546,25 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                             "match=$targetHit"
                     )
                 }
-                if (!targetHit) return@runCatching
+                if (!targetHit) {
+                    logTargetMismatch("friend_clue_h5", hookPointOf(method), sourceUrl, activity, param.thisObject)
+                    reportHookEvent(
+                        event = "friend_clue_h5_entry",
+                        hookPoint = hookPointOf(method),
+                        page = "friend_clue_h5",
+                        strategy = "h5_entry",
+                        targetMatched = false,
+                        message = "friend clue entry skipped: target not matched",
+                        rule = rule
+                    )
+                    return@runCatching
+                }
+                increaseCounter(COUNTER_TARGET_MATCHED)
                 val rewrite = rewriteFriendClueUrl(sourceUrl, rule)
-                if (!rewrite.changed) return@runCatching
+                if (!rewrite.changed) {
+                    markRewriteResult(false)
+                    return@runCatching
+                }
                 if (looksLikeHttpUrl(secondArg)) {
                     param.args[1] = rewrite.newUrl
                 } else {
@@ -496,10 +583,11 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                     rule = rule,
                     extras = mapOf(
                         "touchedKeys" to rewrite.touchedKeys.joinToString(",")
-                    )
+                    ),
+                    rewriteChanged = true
                 )
                 debugLog("friend clue strategy=url-params, touched=${rewrite.touchedKeys}")
-            }.onFailure { traceError(it) }
+            }.onFailure { onHookError("hook/friend_clue_entry", it) }
         }
     }
 
@@ -509,7 +597,12 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     }
 
     private fun hookFriendClueLoadUrlClass(className: String) {
-        val clazz = runCatching { Initiator.loadClass(className) }.getOrNull() ?: return
+        val clazz = runCatching { Initiator.loadClass(className) }.getOrElse {
+            increaseCounter(COUNTER_DEX_RESOLVE_FAILED)
+            increaseCounter(COUNTER_HOOK_INSTALL_FAILED)
+            onHookError("resolve/friend_clue_webview/$className", it)
+            return
+        }
         val hookedSignatures = HashSet<String>(4)
         var hasHooked = false
         for (method in clazz.declaredMethods) {
@@ -520,6 +613,7 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
             val signature = "${clazz.name}#${method.name}${p.joinToString(prefix = "(", postfix = ")") { it.name }}"
             if (!hookedSignatures.add(signature)) continue
             hasHooked = true
+            debugLog("resolve success hook=friend_clue_webview, method=$signature")
             hookBeforeIfEnabled(method) { param ->
                 runCatching {
                     if (!isRuntimeReady()) return@runCatching
@@ -528,7 +622,11 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                     val rule = resolveRuntimeRule() ?: return@runCatching
                     val webView = param.thisObject
                     val activity = resolveActivityFromWebView(webView)
-                    if (!isTargetFriendForUrl(oldUrl, null, activity, webView, param.thisObject)) return@runCatching
+                    if (!isTargetFriendForUrl(oldUrl, null, activity, webView, param.thisObject)) {
+                        logTargetMismatch("friend_clue_h5", hookPointOf(method), oldUrl, activity, webView, param.thisObject)
+                        return@runCatching
+                    }
+                    increaseCounter(COUNTER_TARGET_MATCHED)
                     val rewrite = rewriteFriendClueUrl(oldUrl, rule)
                     markHookHit(HOOK_HIT_FRIEND_CLUE_WEBVIEW)
                     if (NtPeerHelper.isDebugEnabled()) {
@@ -550,25 +648,44 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                             targetMatched = true,
                             message = "rewrite friend clue webview loadUrl",
                             rule = rule,
-                            extras = mapOf("touchedKeys" to rewrite.touchedKeys.joinToString(","))
+                            extras = mapOf("touchedKeys" to rewrite.touchedKeys.joinToString(",")),
+                            rewriteChanged = true
                         )
                         debugLog("friend clue strategy=webview-url, touched=${rewrite.touchedKeys}")
+                    } else {
+                        markRewriteResult(false)
                     }
-                }.onFailure { traceError(it) }
+                }.onFailure { onHookError("hook/friend_clue_webview_loadurl", it) }
             }
         }
         if (hasHooked) {
             markHookInstalled(HOOK_INSTALLED_FRIEND_CLUE_WEBVIEW, clazz)
+            increaseCounter(COUNTER_DEX_RESOLVE_SUCCESS)
+            debugLog("resolve success hook=friend_clue_webview, class=${clazz.name}")
+        } else {
+            increaseCounter(COUNTER_DEX_RESOLVE_FAILED)
+            increaseCounter(COUNTER_HOOK_INSTALL_FAILED)
+            val ex = NoSuchMethodException("No loadUrl candidate in ${clazz.name}")
+            onHookError("resolve/friend_clue_webview/no_method", ex)
         }
     }
 
     private fun installFriendClueJsBridgeHook() {
-        val clazz = runCatching { Initiator.loadClass("com.tencent.mobileqq.webview.swift.JsBridgeListener") }.getOrNull() ?: return
+        val clazz = runCatching { Initiator.loadClass("com.tencent.mobileqq.webview.swift.JsBridgeListener") }.getOrElse {
+            increaseCounter(COUNTER_DEX_RESOLVE_FAILED)
+            increaseCounter(COUNTER_HOOK_INSTALL_FAILED)
+            onHookError("resolve/friend_clue_jsbridge/class", it)
+            return
+        }
+        var hasMethod = false
         val jsonMethod = clazz.declaredMethods.firstOrNull { m ->
             val p = m.parameterTypes
             m.name == "d" && p.size == 1 && p[0] == JSONObject::class.java
         }
         if (jsonMethod != null) {
+            hasMethod = true
+            increaseCounter(COUNTER_DEX_RESOLVE_SUCCESS)
+            debugLog("resolve success hook=friend_clue_jsbridge, method=${hookPointOf(jsonMethod)}")
             markHookInstalled(HOOK_INSTALLED_FRIEND_CLUE_JSBRIDGE, jsonMethod)
             hookBeforeIfEnabled(jsonMethod) { param ->
                 runCatching {
@@ -580,9 +697,13 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                     if (!isFriendClueUrl(url)) return@runCatching
                     val rule = resolveRuntimeRule() ?: return@runCatching
                     val activity = resolveActivityFromWebView(webView)
-                    if (!isTargetFriendForUrl(url, null, activity, webView, listener)) return@runCatching
+                    if (!isTargetFriendForUrl(url, null, activity, webView, listener)) {
+                        logTargetMismatch("friend_clue_h5", hookPointOf(jsonMethod), url, activity, webView, listener)
+                        return@runCatching
+                    }
+                    increaseCounter(COUNTER_TARGET_MATCHED)
+                    markHookHit(HOOK_HIT_FRIEND_CLUE_JSBRIDGE)
                     if (rewriteFriendClueJson(payload, rule, 0)) {
-                        markHookHit(HOOK_HIT_FRIEND_CLUE_JSBRIDGE)
                         reportHookEvent(
                             event = "friend_clue_jsbridge_rewrite",
                             hookPoint = hookPointOf(jsonMethod),
@@ -590,11 +711,14 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                             strategy = "jsbridge_layer",
                             targetMatched = true,
                             message = "rewrite friend clue jsbridge json payload",
-                            rule = rule
+                            rule = rule,
+                            rewriteChanged = true
                         )
                         debugLog("friend clue strategy=jsbridge-json, method=d")
+                    } else {
+                        markRewriteResult(false)
                     }
-                }.onFailure { traceError(it) }
+                }.onFailure { onHookError("hook/friend_clue_jsbridge_d", it) }
             }
         }
         val objMethod = clazz.declaredMethods.firstOrNull { m ->
@@ -602,6 +726,9 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
             m.name == "c" && p.size == 1
         }
         if (objMethod != null) {
+            hasMethod = true
+            increaseCounter(COUNTER_DEX_RESOLVE_SUCCESS)
+            debugLog("resolve success hook=friend_clue_jsbridge, method=${hookPointOf(objMethod)}")
             markHookInstalled(HOOK_INSTALLED_FRIEND_CLUE_JSBRIDGE, objMethod)
             hookBeforeIfEnabled(objMethod) { param ->
                 runCatching {
@@ -612,12 +739,16 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                     if (!isFriendClueUrl(url)) return@runCatching
                     val rule = resolveRuntimeRule() ?: return@runCatching
                     val activity = resolveActivityFromWebView(webView)
-                    if (!isTargetFriendForUrl(url, null, activity, webView, listener)) return@runCatching
+                    if (!isTargetFriendForUrl(url, null, activity, webView, listener)) {
+                        logTargetMismatch("friend_clue_h5", hookPointOf(objMethod), url, activity, webView, listener)
+                        return@runCatching
+                    }
+                    increaseCounter(COUNTER_TARGET_MATCHED)
+                    markHookHit(HOOK_HIT_FRIEND_CLUE_JSBRIDGE)
                     val payload = param.args.getOrNull(0) ?: return@runCatching
                     when (payload) {
                         is JSONObject -> {
                             if (rewriteFriendClueJson(payload, rule, 0)) {
-                                markHookHit(HOOK_HIT_FRIEND_CLUE_JSBRIDGE)
                                 reportHookEvent(
                                     event = "friend_clue_jsbridge_rewrite",
                                     hookPoint = hookPointOf(objMethod),
@@ -625,17 +756,22 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                                     strategy = "jsbridge_layer",
                                     targetMatched = true,
                                     message = "rewrite friend clue jsbridge JSONObject payload",
-                                    rule = rule
+                                    rule = rule,
+                                    rewriteChanged = true
                                 )
                                 debugLog("friend clue strategy=jsbridge-json, method=c(JSONObject)")
+                            } else {
+                                markRewriteResult(false)
                             }
                         }
 
                         is String -> {
-                            val updated = rewriteFriendClueJsonString(payload, rule) ?: return@runCatching
+                            val updated = rewriteFriendClueJsonString(payload, rule) ?: run {
+                                markRewriteResult(false)
+                                return@runCatching
+                            }
                             if (updated != payload) {
                                 param.args[0] = updated
-                                markHookHit(HOOK_HIT_FRIEND_CLUE_JSBRIDGE)
                                 reportHookEvent(
                                     event = "friend_clue_jsbridge_rewrite",
                                     hookPoint = hookPointOf(objMethod),
@@ -643,19 +779,29 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                                     strategy = "jsbridge_layer",
                                     targetMatched = true,
                                     message = "rewrite friend clue jsbridge String payload",
-                                    rule = rule
+                                    rule = rule,
+                                    rewriteChanged = true
                                 )
                                 debugLog("friend clue strategy=jsbridge-json, method=c(String)")
+                            } else {
+                                markRewriteResult(false)
                             }
                         }
                     }
-                }.onFailure { traceError(it) }
+                }.onFailure { onHookError("hook/friend_clue_jsbridge_c", it) }
             }
+        }
+        if (!hasMethod) {
+            increaseCounter(COUNTER_DEX_RESOLVE_FAILED)
+            increaseCounter(COUNTER_HOOK_INSTALL_FAILED)
+            val ex = NoSuchMethodException("No jsbridge method d/c in ${clazz.name}")
+            onHookError("resolve/friend_clue_jsbridge/no_method", ex)
         }
     }
 
     private fun installFriendCluePageFinishedHook() {
         val method = resolveHookMethod(
+            hookTag = "friend_clue_dom_page_finished",
             target = null,
             fallbackClassNames = arrayOf("com.tencent.mobileqq.webview.swift.al", "com.tencent.mobileqq.activity.QQBrowserActivity")
         ) { m ->
@@ -674,7 +820,12 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                 val url = (param.args.getOrNull(1) as? String)?.takeIf { it.isNotBlank() } ?: getWebViewCurrentUrl(webView) ?: return@runCatching
                 if (!isFriendClueUrl(url)) return@runCatching
                 val activity = resolveActivityFromWebView(webView) ?: (param.thisObject as? Activity)
-                if (!isTargetFriendForUrl(url, null, activity, webView, param.thisObject)) return@runCatching
+                if (!isTargetFriendForUrl(url, null, activity, webView, param.thisObject)) {
+                    logTargetMismatch("friend_clue_h5", hookPointOf(method), url, activity, webView, param.thisObject)
+                    return@runCatching
+                }
+                increaseCounter(COUNTER_TARGET_MATCHED)
+                markHookHit(HOOK_HIT_FRIEND_CLUE_DOM)
                 if (NtPeerHelper.isDebugEnabled()) {
                     val meta = parseUrlMeta(url)
                     val (dbgUin, dbgUid, dbgPeer) = getUrlIdentity(url)
@@ -687,9 +838,11 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                             "uin=${maskId(dbgUin)}, uid=${maskId(dbgUid)}, peer=${maskId(dbgPeer)}, extras=$extras"
                     )
                 }
-                if (!shouldInjectFriendClueDomPatch(webView, url)) return@runCatching
+                if (!shouldInjectFriendClueDomPatch(webView, url)) {
+                    markRewriteResult(false)
+                    return@runCatching
+                }
                 injectFriendClueDomPatch(webView, rule)
-                markHookHit(HOOK_HIT_FRIEND_CLUE_DOM)
                 reportHookEvent(
                     event = "friend_clue_dom_fallback",
                     hookPoint = hookPointOf(method),
@@ -697,10 +850,11 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                     strategy = "dom_fallback",
                     targetMatched = true,
                     message = "inject friend clue dom fallback patch",
-                    rule = rule
+                    rule = rule,
+                    rewriteChanged = true
                 )
                 debugLog("friend clue strategy=dom-fallback, pageFinished injected")
-            }.onFailure { traceError(it) }
+            }.onFailure { onHookError("hook/friend_clue_dom_page_finished", it) }
         }
     }
 
@@ -1190,7 +1344,7 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                 .replace("\r", " ")
                 .replace("\t", " ")
             loadUrlMethod.invoke(webView, "javascript:$compactScript")
-        }.onFailure { traceError(it) }
+        }.onFailure { onHookError("hook/friend_clue_dom_eval", it) }
     }
 
     private fun extractWebViewFromJsBridgeListener(listener: Any): Any? {
@@ -1445,9 +1599,18 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     }
 
     private fun isRuntimeReady(): Boolean {
-        if (!QAppUtils.isQQnt()) return false
-        if (!isFeatureEnabledEffective()) return false
-        if (resolveRuntimeRule() == null) return false
+        if (!QAppUtils.isQQnt()) {
+            debugLog("runtime guard: skip, not QQNT")
+            return false
+        }
+        if (!isFeatureEnabledEffective()) {
+            debugLog("runtime guard: skip, feature disabled")
+            return false
+        }
+        if (resolveRuntimeRule() == null) {
+            debugLog("runtime guard: skip, runtime rule unavailable")
+            return false
+        }
         return true
     }
 
@@ -1487,33 +1650,47 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     }
 
     private fun resolveHookMethod(
+        hookTag: String,
         target: DexKitTarget?,
         fallbackClassNames: Array<String>,
         checker: (Method) -> Boolean
     ): Method? {
+        debugLog(
+            "resolving target hook=$hookTag, dexTarget=${target?.javaClass?.simpleName ?: "-"}, " +
+                "fallback=${fallbackClassNames.joinToString()}"
+        )
         val classCandidates = LinkedHashSet<Class<*>>(4)
         if (target != null) {
             runCatching { DexKit.requireClassFromCache(target) }.onSuccess {
                 classCandidates.add(it)
             }.onFailure {
-                traceError(it)
+                onHookError("resolve/$hookTag/dexkit", it)
             }
         }
         for (name in fallbackClassNames) {
             runCatching { Initiator.loadClass(name) }.onSuccess {
                 classCandidates.add(it)
             }.onFailure {
-                traceError(it)
+                onHookError("resolve/$hookTag/fallback:$name", it)
             }
         }
         for (clazz in classCandidates) {
             val method = clazz.declaredMethods.firstOrNull(checker)
             if (method != null) {
                 method.isAccessible = true
+                increaseCounter(COUNTER_DEX_RESOLVE_SUCCESS)
+                debugLog(
+                    "resolve success hook=$hookTag, class=${clazz.name}, " +
+                        "method=${hookPointOf(method)}"
+                )
                 return method
             }
         }
-        traceError(NoSuchMethodException("No matching method in ${classCandidates.joinToString { it.name }}"))
+        increaseCounter(COUNTER_DEX_RESOLVE_FAILED)
+        increaseCounter(COUNTER_HOOK_INSTALL_FAILED)
+        val classList = classCandidates.joinToString { it.name }
+        val ex = NoSuchMethodException("No matching method hook=$hookTag in $classList")
+        onHookError("resolve/$hookTag/no_match", ex)
         return null
     }
 
@@ -1581,14 +1758,53 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         }.getOrNull()
     }
 
+    private fun increaseCounter(key: String, delta: Long = 1L): Long {
+        return mHookHitCounters.getOrPut(key) { AtomicLong(0L) }.addAndGet(delta)
+    }
+
+    private fun onHookError(stage: String, error: Throwable) {
+        mLastError = "$stage:${error.javaClass.simpleName}"
+        traceError(error)
+        reportHookEvent(
+            event = "hook_error",
+            hookPoint = stage,
+            page = "runtime",
+            strategy = "error",
+            targetMatched = false,
+            message = "hook error at $stage",
+            extras = mapOf("error" to "${error.javaClass.simpleName}:${error.message.orEmpty().take(120)}"),
+            level = "ERROR"
+        )
+    }
+
+    private fun markRewriteResult(changed: Boolean) {
+        if (changed) {
+            increaseCounter(COUNTER_REWRITE_SUCCESS)
+        } else {
+            increaseCounter(COUNTER_REWRITE_SKIPPED)
+        }
+    }
+
     private fun markHookInstalled(key: String, anchor: Any?) {
-        mHookInstalledState[key] = true
+        val firstInstalled = mHookInstalledState.put(key, true) != true
+        val anchorName = when (anchor) {
+            is Method -> hookPointOf(anchor)
+            is Class<*> -> anchor.name
+            else -> anchor?.javaClass?.name ?: "-"
+        }
+        if (firstInstalled) {
+            increaseCounter(COUNTER_HOOK_INSTALL_SUCCESS)
+            reportHookEvent(
+                event = "hook_install_success",
+                hookPoint = anchorName,
+                page = "startup",
+                strategy = "install",
+                targetMatched = false,
+                message = "hook install success",
+                extras = mapOf("hookKey" to key)
+            )
+        }
         if (NtPeerHelper.isDebugEnabled()) {
-            val anchorName = when (anchor) {
-                is Method -> hookPointOf(anchor)
-                is Class<*> -> anchor.name
-                else -> anchor?.javaClass?.name ?: "-"
-            }
             debugLog("hook installed: $key <- $anchorName")
         }
     }
@@ -1601,6 +1817,7 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         mHookHitCounters.clear()
         mLastFriendClueDomPatchSignature = ""
         mLastFriendClueDomPatchTs = 0L
+        mLastError = "-"
     }
 
     private fun hookPointOf(method: Method): String {
@@ -1616,6 +1833,72 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         val target = getEffectiveTarget()
         val raw = target.targetUidOrPeer ?: target.targetUin
         return NtPeerHelper.maskIdentifier(raw)
+    }
+
+    private fun logTargetMismatch(page: String, hookPoint: String, vararg candidates: Any?) {
+        increaseCounter(COUNTER_REWRITE_SKIPPED)
+        val snapshot = capturePeerSnapshot(*candidates)
+        val currentType = snapshot.first
+        val currentMasked = snapshot.second
+        val target = getEffectiveTarget()
+        val targetUinMasked = NtPeerHelper.maskUin(target.targetUin)
+        val targetUidMasked = NtPeerHelper.maskUid(target.targetUidOrPeer)
+        val note = if (currentType == "uid" && target.targetUidOrPeer.isNullOrBlank()) {
+            "current page only exposes uid, target_uin cannot match directly"
+        } else {
+            ""
+        }
+        debugLog(
+            "target mismatch page=$page, hook=$hookPoint, currentPeerType=$currentType, " +
+                "currentPeerMasked=$currentMasked, targetUinMasked=$targetUinMasked, " +
+                "targetUidMasked=$targetUidMasked, targetMatched=false, note=$note"
+        )
+        reportHookEvent(
+            event = "target_mismatch",
+            hookPoint = hookPoint,
+            page = page,
+            strategy = "target_match",
+            targetMatched = false,
+            message = "target not matched on hook",
+            extras = mapOf(
+                "currentPeerType" to currentType,
+                "currentPeerMasked" to currentMasked,
+                "targetUinMasked" to targetUinMasked,
+                "targetUidMasked" to targetUidMasked,
+                "note" to note
+            )
+        )
+    }
+
+    private fun capturePeerSnapshot(vararg candidates: Any?): Pair<String, String> {
+        for (candidate in candidates) {
+            if (candidate == null) continue
+            when (candidate) {
+                is CharSequence -> {
+                    val raw = candidate.toString().trim()
+                    if (raw.isEmpty()) continue
+                    if (raw.all { it.isDigit() }) return "uin" to NtPeerHelper.maskIdentifier(raw)
+                    if (raw.startsWith("u_", ignoreCase = true) || raw.startsWith("uid_", ignoreCase = true)) {
+                        return "uid" to NtPeerHelper.maskIdentifier(raw)
+                    }
+                }
+
+                is Number -> {
+                    val raw = candidate.toLong().toString()
+                    if (raw.isNotEmpty()) return "uin" to NtPeerHelper.maskIdentifier(raw)
+                }
+            }
+            val peer = NtPeerHelper.extractPeerIdFromObject(candidate)
+            if (!peer.isNullOrBlank()) {
+                val type = if (peer.startsWith("uid_", ignoreCase = true) || peer.startsWith("u_", ignoreCase = true)) "uid" else "peerId"
+                return type to NtPeerHelper.maskIdentifier(peer)
+            }
+            val uin = NtPeerHelper.extractUinFromObject(candidate)
+            if (!uin.isNullOrBlank()) {
+                return "uin" to NtPeerHelper.maskIdentifier(uin)
+            }
+        }
+        return "-" to "-"
     }
 
     private fun maskTextForReport(raw: String?): String {
@@ -1634,8 +1917,13 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         message: String,
         rule: RuntimeRule? = null,
         extras: Map<String, Any?> = emptyMap(),
+        rewriteChanged: Boolean? = null,
         level: String = "INFO"
     ) {
+        when (rewriteChanged) {
+            true -> increaseCounter(COUNTER_REWRITE_SUCCESS)
+            false -> increaseCounter(COUNTER_REWRITE_SKIPPED)
+        }
         if (!NtPeerHelper.isDebugEnabled()) return
         val payload = LinkedHashMap<String, Any?>(16)
         payload["hookPoint"] = hookPoint
@@ -1652,6 +1940,66 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
             payload[k] = v
         }
         FakeFriendAddDateDebugReporter.report(level, event, message, payload)
+    }
+
+    private fun printStartupDiagnostics() {
+        if (mStartupDiagLogged) return
+        mStartupDiagLogged = true
+        val debugEnabled = NtPeerHelper.isDebugEnabled()
+        val target = getEffectiveTarget()
+        val targetUinRaw = NtPeerHelper.getConfigTargetUin()
+        val targetUidRaw = NtPeerHelper.getConfigTargetUid()
+        val fakeDateRaw = NtPeerHelper.getConfigFakeAddDate()
+        val fakeTsRaw = NtPeerHelper.getConfigFakeAddTimestamp()
+        val cfg = ConfigManager.getDefaultConfig()
+        val enabledRawExists = cfg.containsKey(NtPeerHelper.KEY_ENABLED) || cfg.containsKey(NtPeerHelper.KEY_ENABLED_LEGACY)
+        val enabledFinal = isFeatureEnabledEffective()
+        val processName = runCatching { SyncUtils.getProcessName() }.getOrDefault("-")
+        val packageName = runCatching { HostInfo.getPackageName() }.getOrDefault("-")
+        val processAccepted = processName == packageName
+        val hostVersionName = runCatching { HostInfo.getVersionName() }.getOrDefault("-")
+        val hostVersionCode = runCatching { HostInfo.getVersionCode() }.getOrDefault(0)
+        val startupMeta = linkedMapOf<String, Any?>(
+            "moduleLoaded" to true,
+            "processName" to processName,
+            "processAccepted" to processAccepted,
+            "hostPackageName" to packageName,
+            "hostVersionName" to hostVersionName,
+            "hostVersionCode" to hostVersionCode,
+            "enabledRawExists" to enabledRawExists,
+            "enabledFinal" to enabledFinal,
+            "targetUinFinal" to NtPeerHelper.maskUin(target.targetUin),
+            "targetUidFinal" to NtPeerHelper.maskUid(target.targetUidOrPeer),
+            "targetPeerFromUin" to NtPeerHelper.maskUid(target.targetPeerFromUin),
+            "targetUinRaw" to NtPeerHelper.maskUin(targetUinRaw),
+            "targetUidRaw" to NtPeerHelper.maskUid(targetUidRaw),
+            "fakeAddDateRaw" to (fakeDateRaw ?: ""),
+            "fakeAddDateFinal" to getFakeAddDateOrDefault(),
+            "fakeAddTimestampFinal" to (parseConfiguredDateMillis() ?: 0L),
+            "fakeAddTimestampRaw" to (fakeTsRaw ?: 0L),
+            "debugLogFinal" to debugEnabled,
+            "debugServerEnabledFinal" to NtPeerHelper.isDebugServerEnabled(),
+            "debugServerUrlFinal" to NtPeerHelper.getDebugServerUrl(DEFAULT_DEBUG_SERVER_URL)
+        )
+        Log.d(
+            "FakeFriendAddDateNt init diagnostics: " +
+                "process=$processName, pkg=$packageName, version=$hostVersionName($hostVersionCode), " +
+                "processAccepted=$processAccepted, " +
+                "enabledRawExists=$enabledRawExists, enabledFinal=$enabledFinal, " +
+                "targetUin=${NtPeerHelper.maskUin(target.targetUin)}, targetUid=${NtPeerHelper.maskUid(target.targetUidOrPeer)}, " +
+                "fakeAddDate=${getFakeAddDateOrDefault()}, debugLog=$debugEnabled, " +
+                "debugServer=${NtPeerHelper.isDebugServerEnabled()}, " +
+                "debugServerUrl=${NtPeerHelper.getDebugServerUrl(DEFAULT_DEBUG_SERVER_URL)}"
+        )
+        if (debugEnabled) {
+            debugLog("startup diagnostics: $startupMeta")
+        }
+        FakeFriendAddDateDebugReporter.report(
+            level = "INFO",
+            event = "startup_diagnostics",
+            message = "module loaded diagnostics",
+            extras = startupMeta
+        )
     }
 
     private fun refreshDebugTransportState() {
@@ -1809,6 +2157,10 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
 
     private fun buildDumpConfigJson(): JSONObject {
         val cfg = JSONObject()
+        val config = ConfigManager.getDefaultConfig()
+        val enabledRawExists = config.containsKey(NtPeerHelper.KEY_ENABLED) || config.containsKey(NtPeerHelper.KEY_ENABLED_LEGACY)
+        cfg.put("enabledRawExists", enabledRawExists)
+        cfg.put("enabledFinal", isFeatureEnabledEffective())
         cfg.put("enabled", isFeatureEnabledEffective())
         cfg.put("debugLog", NtPeerHelper.isDebugEnabled())
         cfg.put("debugServerEnabled", NtPeerHelper.isDebugServerEnabled())
@@ -1819,10 +2171,19 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         cfg.put("targetUin", NtPeerHelper.maskUin(target.targetUin))
         cfg.put("targetUid", NtPeerHelper.maskUid(target.targetUidOrPeer))
         cfg.put("targetPeerFromUin", NtPeerHelper.maskUid(target.targetPeerFromUin))
+        cfg.put("targetUinRawMasked", NtPeerHelper.maskUin(NtPeerHelper.getConfigTargetUin()))
+        cfg.put("targetUidRawMasked", NtPeerHelper.maskUid(NtPeerHelper.getConfigTargetUid()))
         cfg.put("fakeAddDate", getFakeAddDateOrDefault())
+        cfg.put("fakeAddDateRaw", NtPeerHelper.getConfigFakeAddDate().orEmpty())
+        cfg.put("fakeAddTimestampRaw", NtPeerHelper.getConfigFakeAddTimestamp() ?: 0L)
+        cfg.put("fakeAddTimestampFinal", parseConfiguredDateMillis() ?: 0L)
         cfg.put("hasUserConfig", target.hasUserConfig)
         cfg.put("profilePageEnabled", isProfilePageEnabled())
         cfg.put("chatSettingEnabled", isChatSettingPageEnabled())
+        cfg.put("processName", runCatching { SyncUtils.getProcessName() }.getOrDefault("-"))
+        cfg.put("hostPackageName", runCatching { HostInfo.getPackageName() }.getOrDefault("-"))
+        cfg.put("hostVersionName", runCatching { HostInfo.getVersionName() }.getOrDefault("-"))
+        cfg.put("hostVersionCode", runCatching { HostInfo.getVersionCode() }.getOrDefault(0))
         return cfg
     }
 
@@ -1859,6 +2220,27 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
             val value = mHookHitCounters[key]?.get() ?: 0L
             result.put(key, value)
         }
+        val requiredCounters = arrayOf(
+            COUNTER_INIT_CALLED,
+            COUNTER_DEX_RESOLVE_SUCCESS,
+            COUNTER_DEX_RESOLVE_FAILED,
+            COUNTER_HOOK_INSTALL_SUCCESS,
+            COUNTER_HOOK_INSTALL_FAILED,
+            HOOK_HIT_INTIMATE_HEADER,
+            HOOK_HIT_INTIMATE_DAYS_COMPUTE,
+            HOOK_HIT_RELATION_DAY_BIND,
+            HOOK_HIT_MEMORY_TIMELINE,
+            HOOK_HIT_DNA_BIND,
+            HOOK_HIT_FRIEND_CLUE_ENTRY,
+            COUNTER_TARGET_MATCHED,
+            COUNTER_REWRITE_SUCCESS,
+            COUNTER_REWRITE_SKIPPED
+        )
+        for (key in requiredCounters) {
+            val value = mHookHitCounters[key]?.get() ?: 0L
+            result.put(key, value)
+        }
+        result.put("lastError", mLastError)
         result.put("initReadyForDebugChannel", mInitReadyForDebugChannel)
         return result
     }
