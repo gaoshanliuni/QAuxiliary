@@ -1245,3 +1245,17 @@ data object NT_Profile_UnbindAddDate_Bind : DexKitTarget.UsingStringVector() {
     override val declaringClass = ""
     override val filter = DexKitFilter.allowAll
 }
+
+data object NT_Profile_MemoryDay_Helper : DexKitTarget.UsingStringVector() {
+    override val findMethod = false
+    override val traitStringVectors = arrayOf(arrayOf("jumph5Url strUrl Empty", "intimate_relationship"))
+    override val declaringClass = ""
+    override val filter = DexKitFilter.strInClsName("com/tencent/mobileqq/activity/aio/intimate/")
+}
+
+data object NT_Profile_NewDna_Adapter : DexKitTarget.UsingStringVector() {
+    override val findMethod = false
+    override val traitStringVectors = arrayOf(arrayOf("IntimateContentItemNewDnaView", "em_bas_friend_dna"))
+    override val declaringClass = ""
+    override val filter = DexKitFilter.strInClsName("com/tencent/mobileqq/activity/aio/intimate/view/")
+}
