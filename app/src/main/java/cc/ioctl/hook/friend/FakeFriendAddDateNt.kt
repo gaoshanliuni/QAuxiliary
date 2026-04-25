@@ -24,6 +24,8 @@ package cc.ioctl.hook.friend
 
 import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
+import android.net.Uri
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
@@ -59,8 +61,14 @@ import io.github.qauxv.util.dexkit.NT_Profile_NewDna_Adapter
 import io.github.qauxv.util.dexkit.NT_Profile_RelationInfo_Bind
 import io.github.qauxv.util.dexkit.NT_Profile_UnbindAddDate_Bind
 import kotlinx.coroutines.flow.MutableStateFlow
+import org.json.JSONArray
+import org.json.JSONObject
 import java.lang.reflect.Method
 import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.temporal.ChronoUnit
 import java.util.Calendar
 import java.util.LinkedHashSet
 import java.util.Locale
@@ -97,6 +105,18 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         "成为好友", "添加好友", "好友添加", "添加时间", "加好友", "加为好友", "已成为好友", "已绑定", "友谊时间线", "DNA"
     )
 
+    private val friendClueUrlHints = arrayOf("ti.qq.com/friends/recall", "friendclue", "relationx/friend")
+    private val friendClueIdentityQueryKeys = arrayOf("uin", "uid", "peerId", "peerid")
+    private val friendClueTimeQueryKeys = arrayOf("addTime", "addFriendTime", "friendTime", "relationTime", "startTime", "time", "ts")
+    private val friendClueDayQueryKeys = arrayOf("days", "becomeFriendDays", "relationDays", "friendDays")
+    private val friendClueDateQueryKeys = arrayOf("friendDate", "addDate")
+
+    @Volatile
+    private var mLastFriendClueDomPatchSignature: String = ""
+
+    @Volatile
+    private var mLastFriendClueDomPatchTs: Long = 0L
+
     private val dateRegex = Regex("(\\d{4}[-./]\\d{1,2}[-./]\\d{1,2}|\\d{4}年\\d{1,2}月\\d{1,2}日|\\d{1,2}月\\d{1,2}日)")
     private val dayRegex = Regex("((?:成为好友|已成为好友|已绑定)\\s*)(\\d+)(\\s*天)")
 
@@ -115,6 +135,9 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         installMemoryDayHook()
         installDnaItemBindHook()
         installFriendClueEntryHook()
+        installFriendClueWebViewLoadHook()
+        installFriendClueJsBridgeHook()
+        installFriendCluePageFinishedHook()
         return true
     }
 
@@ -288,13 +311,196 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         hookBeforeIfEnabled(method) { param ->
             runCatching {
                 if (!isRuntimeReady()) return@runCatching
-                if (!NtPeerHelper.isDebugEnabled()) return@runCatching
-                val uin = param.args.getOrNull(1)?.toString()
-                val hit = NtPeerHelper.isNtTargetPeer(uin)
-                debugLog("friend clue entry: uin=${maskId(uin)}, match=$hit")
+                val rule = resolveRuntimeRule() ?: return@runCatching
+                val activity = param.args.getOrNull(0) as? Activity
+                val secondArg = param.args.getOrNull(1)?.toString()?.trim().orEmpty()
+                if (secondArg.isEmpty()) return@runCatching
+                val sourceUrl = if (looksLikeHttpUrl(secondArg)) secondArg else buildFriendClueUrl(secondArg)
+                val urlMeta = parseUrlMeta(sourceUrl)
+                val (dbgUin, dbgUid, dbgPeer) = getUrlIdentity(sourceUrl)
+                val targetHit = isTargetFriendForUrl(
+                    sourceUrl,
+                    if (looksLikeHttpUrl(secondArg)) null else secondArg,
+                    activity,
+                    param.thisObject
+                )
+                if (NtPeerHelper.isDebugEnabled()) {
+                    debugLog(
+                        "friend clue entry: class=${param.thisObject?.javaClass?.name}, " +
+                            "argIsUrl=${looksLikeHttpUrl(secondArg)}, host=${urlMeta?.host ?: "-"}, " +
+                            "path=${urlMeta?.path ?: "-"}, keys=${urlMeta?.queryKeys ?: emptyList<String>()}, " +
+                            "uin=${maskId(dbgUin)}, uid=${maskId(dbgUid)}, peer=${maskId(dbgPeer)}, " +
+                            "match=$targetHit"
+                    )
+                }
+                if (!targetHit) return@runCatching
+                val rewrite = rewriteFriendClueUrl(sourceUrl, rule)
+                if (!rewrite.changed) return@runCatching
+                if (looksLikeHttpUrl(secondArg)) {
+                    param.args[1] = rewrite.newUrl
+                } else {
+                    val encodedTail = buildFriendClueTailFromUrl(rewrite.newUrl, secondArg)
+                    if (!encodedTail.isNullOrEmpty()) {
+                        param.args[1] = encodedTail
+                    }
+                }
+                debugLog("friend clue strategy=url-params, touched=${rewrite.touchedKeys}")
             }.onFailure { traceError(it) }
         }
     }
+
+    private fun installFriendClueWebViewLoadHook() {
+        hookFriendClueLoadUrlClass("com.tencent.smtt.sdk.WebView")
+        hookFriendClueLoadUrlClass("android.webkit.WebView")
+    }
+
+    private fun hookFriendClueLoadUrlClass(className: String) {
+        val clazz = runCatching { Initiator.loadClass(className) }.getOrNull() ?: return
+        val hookedSignatures = HashSet<String>(4)
+        for (method in clazz.declaredMethods) {
+            val p = method.parameterTypes
+            if (method.name != "loadUrl") continue
+            if (p.isEmpty() || p[0] != String::class.java) continue
+            if (p.size != 1 && !(p.size == 2 && Map::class.java.isAssignableFrom(p[1]))) continue
+            val signature = "${clazz.name}#${method.name}${p.joinToString(prefix = "(", postfix = ")") { it.name }}"
+            if (!hookedSignatures.add(signature)) continue
+            hookBeforeIfEnabled(method) { param ->
+                runCatching {
+                    if (!isRuntimeReady()) return@runCatching
+                    val oldUrl = param.args.getOrNull(0) as? String ?: return@runCatching
+                    if (!isFriendClueUrl(oldUrl)) return@runCatching
+                    val rule = resolveRuntimeRule() ?: return@runCatching
+                    val webView = param.thisObject
+                    val activity = resolveActivityFromWebView(webView)
+                    if (!isTargetFriendForUrl(oldUrl, null, activity, webView, param.thisObject)) return@runCatching
+                    val rewrite = rewriteFriendClueUrl(oldUrl, rule)
+                    if (NtPeerHelper.isDebugEnabled()) {
+                        val meta = parseUrlMeta(oldUrl)
+                        val (dbgUin, dbgUid, dbgPeer) = getUrlIdentity(oldUrl)
+                        debugLog(
+                            "friend clue webview.loadUrl: web=${webView?.javaClass?.name}, " +
+                                "host=${meta?.host ?: "-"}, path=${meta?.path ?: "-"}, keys=${meta?.queryKeys ?: emptyList<String>()}, " +
+                                "uin=${maskId(dbgUin)}, uid=${maskId(dbgUid)}, peer=${maskId(dbgPeer)}"
+                        )
+                    }
+                    if (rewrite.changed) {
+                        param.args[0] = rewrite.newUrl
+                        debugLog("friend clue strategy=webview-url, touched=${rewrite.touchedKeys}")
+                    }
+                }.onFailure { traceError(it) }
+            }
+        }
+    }
+
+    private fun installFriendClueJsBridgeHook() {
+        val clazz = runCatching { Initiator.loadClass("com.tencent.mobileqq.webview.swift.JsBridgeListener") }.getOrNull() ?: return
+        val jsonMethod = clazz.declaredMethods.firstOrNull { m ->
+            val p = m.parameterTypes
+            m.name == "d" && p.size == 1 && p[0] == JSONObject::class.java
+        }
+        if (jsonMethod != null) {
+            hookBeforeIfEnabled(jsonMethod) { param ->
+                runCatching {
+                    if (!isRuntimeReady()) return@runCatching
+                    val payload = param.args.getOrNull(0) as? JSONObject ?: return@runCatching
+                    val listener = param.thisObject ?: return@runCatching
+                    val webView = extractWebViewFromJsBridgeListener(listener) ?: return@runCatching
+                    val url = getWebViewCurrentUrl(webView) ?: return@runCatching
+                    if (!isFriendClueUrl(url)) return@runCatching
+                    val rule = resolveRuntimeRule() ?: return@runCatching
+                    val activity = resolveActivityFromWebView(webView)
+                    if (!isTargetFriendForUrl(url, null, activity, webView, listener)) return@runCatching
+                    if (rewriteFriendClueJson(payload, rule, 0)) {
+                        debugLog("friend clue strategy=jsbridge-json, method=d")
+                    }
+                }.onFailure { traceError(it) }
+            }
+        }
+        val objMethod = clazz.declaredMethods.firstOrNull { m ->
+            val p = m.parameterTypes
+            m.name == "c" && p.size == 1
+        }
+        if (objMethod != null) {
+            hookBeforeIfEnabled(objMethod) { param ->
+                runCatching {
+                    if (!isRuntimeReady()) return@runCatching
+                    val listener = param.thisObject ?: return@runCatching
+                    val webView = extractWebViewFromJsBridgeListener(listener) ?: return@runCatching
+                    val url = getWebViewCurrentUrl(webView) ?: return@runCatching
+                    if (!isFriendClueUrl(url)) return@runCatching
+                    val rule = resolveRuntimeRule() ?: return@runCatching
+                    val activity = resolveActivityFromWebView(webView)
+                    if (!isTargetFriendForUrl(url, null, activity, webView, listener)) return@runCatching
+                    val payload = param.args.getOrNull(0) ?: return@runCatching
+                    when (payload) {
+                        is JSONObject -> {
+                            if (rewriteFriendClueJson(payload, rule, 0)) {
+                                debugLog("friend clue strategy=jsbridge-json, method=c(JSONObject)")
+                            }
+                        }
+
+                        is String -> {
+                            val updated = rewriteFriendClueJsonString(payload, rule) ?: return@runCatching
+                            if (updated != payload) {
+                                param.args[0] = updated
+                                debugLog("friend clue strategy=jsbridge-json, method=c(String)")
+                            }
+                        }
+                    }
+                }.onFailure { traceError(it) }
+            }
+        }
+    }
+
+    private fun installFriendCluePageFinishedHook() {
+        val method = resolveHookMethod(
+            target = null,
+            fallbackClassNames = arrayOf("com.tencent.mobileqq.webview.swift.al", "com.tencent.mobileqq.activity.QQBrowserActivity")
+        ) { m ->
+            val p = m.parameterTypes
+            m.returnType == Void.TYPE &&
+                m.name == "onPageFinished" &&
+                p.size == 2 &&
+                p[1] == String::class.java
+        } ?: return
+        hookAfterIfEnabled(method) { param ->
+            runCatching {
+                if (!isRuntimeReady()) return@runCatching
+                val rule = resolveRuntimeRule() ?: return@runCatching
+                val webView = param.args.getOrNull(0) ?: return@runCatching
+                val url = (param.args.getOrNull(1) as? String)?.takeIf { it.isNotBlank() } ?: getWebViewCurrentUrl(webView) ?: return@runCatching
+                if (!isFriendClueUrl(url)) return@runCatching
+                val activity = resolveActivityFromWebView(webView) ?: (param.thisObject as? Activity)
+                if (!isTargetFriendForUrl(url, null, activity, webView, param.thisObject)) return@runCatching
+                if (NtPeerHelper.isDebugEnabled()) {
+                    val meta = parseUrlMeta(url)
+                    val (dbgUin, dbgUid, dbgPeer) = getUrlIdentity(url)
+                    val extras = getIntentExtraKeys(activity)
+                    debugLog(
+                        "friend clue pageFinished: entry=${param.thisObject?.javaClass?.name}, " +
+                            "activity=${activity?.javaClass?.name ?: "-"}, web=${webView.javaClass.name}, " +
+                            "host=${meta?.host ?: "-"}, path=${meta?.path ?: "-"}, keys=${meta?.queryKeys ?: emptyList<String>()}, " +
+                            "uin=${maskId(dbgUin)}, uid=${maskId(dbgUid)}, peer=${maskId(dbgPeer)}, extras=$extras"
+                    )
+                }
+                if (!shouldInjectFriendClueDomPatch(webView, url)) return@runCatching
+                injectFriendClueDomPatch(webView, rule)
+                debugLog("friend clue strategy=dom-fallback, pageFinished injected")
+            }.onFailure { traceError(it) }
+        }
+    }
+
+    private data class UrlMeta(
+        val host: String,
+        val path: String,
+        val queryKeys: List<String>
+    )
+
+    private data class UrlRewriteResult(
+        val newUrl: String,
+        val changed: Boolean,
+        val touchedKeys: List<String>
+    )
 
     private fun rebuildHeaderModel(model: Any, fakeDays: Int): Any? {
         val clazz = model.javaClass
@@ -369,6 +575,472 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
                 }
             }
         }
+    }
+
+    private fun looksLikeHttpUrl(value: String): Boolean {
+        val lower = value.lowercase(Locale.ROOT)
+        return lower.startsWith("https://") || lower.startsWith("http://")
+    }
+
+    private fun buildFriendClueUrl(uin: String): String {
+        return "https://ti.qq.com/friends/recall?uin=${Uri.encode(uin)}"
+    }
+
+    private fun parseUrlMeta(url: String?): UrlMeta? {
+        val raw = url?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+        return runCatching {
+            val uri = Uri.parse(raw)
+            val keys = uri.queryParameterNames.map { it.trim() }.filter { it.isNotEmpty() }.sorted()
+            UrlMeta(host = uri.host.orEmpty(), path = uri.path.orEmpty(), queryKeys = keys)
+        }.getOrNull()
+    }
+
+    private fun getUrlIdentity(url: String?): Triple<String?, String?, String?> {
+        val raw = url?.trim().orEmpty()
+        if (raw.isEmpty()) return Triple(null, null, null)
+        val uri = runCatching { Uri.parse(raw) }.getOrNull() ?: return Triple(null, null, null)
+        val uin = uri.getQueryParameter("uin") ?: uri.getQueryParameter("friendUin")
+        val uid = uri.getQueryParameter("uid") ?: uri.getQueryParameter("friendUid")
+        var peer: String? = null
+        for (key in friendClueIdentityQueryKeys) {
+            if (!key.equals("peerId", ignoreCase = true) && !key.equals("peerid", ignoreCase = true)) continue
+            peer = uri.getQueryParameter(key)
+            if (!peer.isNullOrEmpty()) break
+        }
+        return Triple(uin, uid, peer)
+    }
+
+    private fun isFriendClueUrl(url: String?): Boolean {
+        val raw = url?.trim().orEmpty()
+        if (raw.isEmpty()) return false
+        val lower = raw.lowercase(Locale.ROOT)
+        return friendClueUrlHints.any { lower.contains(it) }
+    }
+
+    private fun isFriendClueTimeQueryKey(key: String): Boolean {
+        return friendClueTimeQueryKeys.any { it.equals(key, ignoreCase = true) }
+    }
+
+    private fun isFriendClueDayQueryKey(key: String): Boolean {
+        return friendClueDayQueryKeys.any { it.equals(key, ignoreCase = true) }
+    }
+
+    private fun isFriendClueDateQueryKey(key: String): Boolean {
+        if (friendClueDateQueryKeys.any { it.equals(key, ignoreCase = true) }) return true
+        return key.contains("date", ignoreCase = true) && key.contains("friend", ignoreCase = true)
+    }
+
+    private fun buildFriendClueTailFromUrl(url: String, fallbackUin: String): String? {
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return null
+        val baseUin = uri.getQueryParameter("uin").orEmpty().ifEmpty { fallbackUin }
+        if (baseUin.isEmpty()) return null
+        val sb = StringBuilder(baseUin)
+        for (key in uri.queryParameterNames) {
+            if (key.equals("uin", ignoreCase = true)) continue
+            val values = uri.getQueryParameters(key)
+            if (values.isEmpty()) {
+                sb.append('&').append(Uri.encode(key)).append('=')
+                continue
+            }
+            for (value in values) {
+                sb.append('&')
+                    .append(Uri.encode(key))
+                    .append('=')
+                    .append(Uri.encode(value))
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun isTargetFriendForUrl(
+        url: String?,
+        fallbackUin: String? = null,
+        activity: Activity? = null,
+        vararg candidates: Any?
+    ): Boolean {
+        val raw = url?.trim().orEmpty()
+        if (raw.isNotEmpty()) {
+            val uri = runCatching { Uri.parse(raw) }.getOrNull()
+            if (uri != null) {
+                val uin = uri.getQueryParameter("uin") ?: uri.getQueryParameter("friendUin") ?: fallbackUin
+                val uid = uri.getQueryParameter("uid")
+                var peer: String? = null
+                for (key in friendClueIdentityQueryKeys) {
+                    if (!key.equals("peerId", ignoreCase = true) && !key.equals("peerid", ignoreCase = true)) continue
+                    peer = uri.getQueryParameter(key)
+                    if (!peer.isNullOrEmpty()) break
+                }
+                if (isTargetByIdentity(uin, uid, peer)) {
+                    return true
+                }
+            }
+        }
+        if (isTargetByIdentity(fallbackUin, null, null)) {
+            return true
+        }
+        val extras = activity?.intent?.extras
+        if (extras != null) {
+            val uin = runCatching { extras.getString("uin") ?: extras.getString("friend_uin") ?: extras.getString("friendUin") }.getOrNull()
+            val uid = runCatching { extras.getString("uid") ?: extras.getString("friendUid") }.getOrNull()
+            val peer = runCatching { extras.getString("peerId") ?: extras.getString("peerid") }.getOrNull()
+            if (isTargetByIdentity(uin, uid, peer)) {
+                return true
+            }
+        }
+        for (candidate in candidates) {
+            if (NtPeerHelper.isNtTargetPeer(candidate)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun isTargetByIdentity(uin: String?, uid: String?, peerId: String?): Boolean {
+        if (!peerId.isNullOrBlank() && NtPeerHelper.isNtTargetPeer(peerId)) {
+            return true
+        }
+        if (!uid.isNullOrBlank() && NtPeerHelper.isNtTargetPeer(uid)) {
+            return true
+        }
+        val uinRaw = uin?.trim().orEmpty()
+        if (uinRaw.isNotEmpty()) {
+            if (NtPeerHelper.isNtTargetPeer(uinRaw)) {
+                return true
+            }
+            val targetPeer = NtPeerHelper.resolveTargetPeerId()
+            if (!targetPeer.isNullOrEmpty()) {
+                val mappedPeer = runCatching {
+                    NtPeerHelper.normalizePeerId(QAppUtils.UserUinToPeerID(uinRaw))
+                }.getOrNull()
+                if (!mappedPeer.isNullOrEmpty() && mappedPeer == targetPeer) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private fun rewriteFriendClueUrl(url: String, rule: RuntimeRule): UrlRewriteResult {
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return UrlRewriteResult(url, false, emptyList())
+        val keys = uri.queryParameterNames
+        if (keys.isEmpty()) return UrlRewriteResult(url, false, emptyList())
+        val hasCandidate = keys.any { key ->
+            isFriendClueTimeQueryKey(key) || isFriendClueDayQueryKey(key) || isFriendClueDateQueryKey(key)
+        }
+        if (!hasCandidate) return UrlRewriteResult(url, false, emptyList())
+        val builder = uri.buildUpon().clearQuery()
+        var changed = false
+        val touched = LinkedHashSet<String>()
+        for (key in keys) {
+            val values = uri.getQueryParameters(key)
+            if (values.isEmpty()) {
+                builder.appendQueryParameter(key, "")
+                continue
+            }
+            for (value in values) {
+                val replacement = rewriteFriendClueQueryValue(key, value, rule)
+                if (replacement != value) {
+                    changed = true
+                    touched.add(key)
+                }
+                builder.appendQueryParameter(key, replacement)
+            }
+        }
+        val newUrl = builder.build().toString()
+        return UrlRewriteResult(newUrl, changed, touched.toList())
+    }
+
+    private fun rewriteFriendClueQueryValue(key: String, value: String?, rule: RuntimeRule): String {
+        if (isFriendClueDayQueryKey(key)) {
+            return rule.days.toString()
+        }
+        if (isFriendClueDateQueryKey(key)) {
+            return rule.addDateText
+        }
+        if (!isFriendClueTimeQueryKey(key)) {
+            return value.orEmpty()
+        }
+        val old = value?.trim().orEmpty()
+        if (old.isEmpty()) return rule.addDateText
+        val numeric = old.toLongOrNull()
+        if (numeric != null) {
+            return if (old.length >= 13) rule.addDateMillis.toString() else (rule.addDateMillis / 1000L).toString()
+        }
+        if (dateRegex.containsMatchIn(old)) {
+            return rule.addDateText
+        }
+        return rule.addDateText
+    }
+
+    private fun rewriteFriendClueJsonString(raw: String, rule: RuntimeRule): String? {
+        val text = raw.trim()
+        if (text.isEmpty()) return null
+        if (!(text.startsWith("{") || text.startsWith("["))) return null
+        return runCatching {
+            if (text.startsWith("{")) {
+                val obj = JSONObject(text)
+                if (rewriteFriendClueJson(obj, rule, 0)) obj.toString() else null
+            } else {
+                val array = JSONArray(text)
+                if (rewriteFriendClueJsonArray(array, rule, 0)) array.toString() else null
+            }
+        }.getOrNull()
+    }
+
+    private fun rewriteFriendClueJson(obj: JSONObject, rule: RuntimeRule, depth: Int): Boolean {
+        if (depth > 3) return false
+        var changed = false
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val value = runCatching { obj.get(key) }.getOrNull() ?: continue
+            when (value) {
+                is JSONObject -> {
+                    if (rewriteFriendClueJson(value, rule, depth + 1)) {
+                        changed = true
+                    }
+                }
+
+                is JSONArray -> {
+                    if (rewriteFriendClueJsonArray(value, rule, depth + 1)) {
+                        changed = true
+                    }
+                }
+
+                is Number, is String -> {
+                    val replacement = when {
+                        isFriendClueDayQueryKey(key) -> rule.days
+                        isFriendClueDateQueryKey(key) -> rule.addDateText
+                        isFriendClueTimeQueryKey(key) -> {
+                            val asText = value.toString().trim()
+                            if (value is Number || asText.all { it.isDigit() }) {
+                                if (asText.length >= 13) rule.addDateMillis else (rule.addDateMillis / 1000L)
+                            } else {
+                                rule.addDateText
+                            }
+                        }
+
+                        else -> null
+                    }
+                    if (replacement != null && replacement != value) {
+                        runCatching { obj.put(key, replacement) }
+                        changed = true
+                    }
+                }
+            }
+        }
+        return changed
+    }
+
+    private fun rewriteFriendClueJsonArray(array: JSONArray, rule: RuntimeRule, depth: Int): Boolean {
+        if (depth > 3) return false
+        var changed = false
+        val max = minOf(array.length(), 64)
+        for (i in 0 until max) {
+            val value = runCatching { array.get(i) }.getOrNull() ?: continue
+            when (value) {
+                is JSONObject -> if (rewriteFriendClueJson(value, rule, depth + 1)) changed = true
+                is JSONArray -> if (rewriteFriendClueJsonArray(value, rule, depth + 1)) changed = true
+            }
+        }
+        return changed
+    }
+
+    private fun shouldInjectFriendClueDomPatch(webView: Any, url: String): Boolean {
+        val now = System.currentTimeMillis()
+        val signature = "${System.identityHashCode(webView)}|${url.hashCode()}|${parseConfiguredDateMillis() ?: 0L}"
+        val lastSig = mLastFriendClueDomPatchSignature
+        val lastTs = mLastFriendClueDomPatchTs
+        if (signature == lastSig && now - lastTs in 0..1500L) {
+            return false
+        }
+        mLastFriendClueDomPatchSignature = signature
+        mLastFriendClueDomPatchTs = now
+        return true
+    }
+
+    private fun injectFriendClueDomPatch(webView: Any, rule: RuntimeRule) {
+        val script = buildFriendClueDomPatchScript(rule)
+        evaluateJavascriptOnWebView(webView, script)
+    }
+
+    private fun buildFriendClueDomPatchScript(rule: RuntimeRule): String {
+        val fakeDate = JSONObject.quote(rule.addDateText)
+        return """
+            (function() {
+              var FAKE_DATE = $fakeDate;
+              var FAKE_DAYS = ${rule.days};
+              var DATE_RE = /(\d{4}[-./]\d{1,2}[-./]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}日)/;
+              var LABELS_DATE = ["他添加我时的日期", "加好友时间"];
+              var LABELS_DAY = ["成为好友"];
+              function patchText(oldText) {
+                if (!oldText) return oldText;
+                var text = oldText;
+                var hasDateLabel = false;
+                for (var i = 0; i < LABELS_DATE.length; i++) {
+                  if (text.indexOf(LABELS_DATE[i]) >= 0) {
+                    hasDateLabel = true;
+                    break;
+                  }
+                }
+                if (hasDateLabel) {
+                  if (DATE_RE.test(text)) {
+                    text = text.replace(new RegExp(DATE_RE.source, "g"), FAKE_DATE);
+                  } else if (text.indexOf("：") >= 0 || text.indexOf(":") >= 0) {
+                    text = text.replace(/([:：]\s*).*/, "$1" + FAKE_DATE);
+                  }
+                }
+                var hasDayLabel = false;
+                for (var j = 0; j < LABELS_DAY.length; j++) {
+                  if (text.indexOf(LABELS_DAY[j]) >= 0) {
+                    hasDayLabel = true;
+                    break;
+                  }
+                }
+                if (hasDayLabel && text.indexOf("天") >= 0) {
+                  text = text.replace(/(成为好友\s*)(\d+)(\s*天)/, "$1" + FAKE_DAYS + "$3");
+                }
+                return text;
+              }
+              function patchNode(node) {
+                if (!node) return false;
+                if (node.nodeType === Node.TEXT_NODE) {
+                  var oldText = node.nodeValue || "";
+                  if (!oldText || oldText.length > 120) return false;
+                  var newText = patchText(oldText);
+                  if (newText !== oldText) {
+                    node.nodeValue = newText;
+                    return true;
+                  }
+                  return false;
+                }
+                if (node.nodeType === Node.ELEMENT_NODE && node.childElementCount === 0) {
+                  var oldElText = node.textContent || "";
+                  if (!oldElText || oldElText.length > 120) return false;
+                  var newElText = patchText(oldElText);
+                  if (newElText !== oldElText) {
+                    node.textContent = newElText;
+                    return true;
+                  }
+                }
+                return false;
+              }
+              function patchAroundLabels() {
+                var root = document.body || document.documentElement;
+                if (!root) return;
+                var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+                var node;
+                while ((node = walker.nextNode())) {
+                  var t = node.nodeValue || "";
+                  if (t.indexOf("他添加我时的日期") < 0 && t.indexOf("加好友时间") < 0 && t.indexOf("成为好友") < 0) {
+                    continue;
+                  }
+                  patchNode(node);
+                  var p = node.parentElement;
+                  if (!p) continue;
+                  patchNode(p);
+                  var prev = p.previousElementSibling;
+                  var next = p.nextElementSibling;
+                  if (prev) {
+                    patchNode(prev);
+                    for (var i = 0; i < prev.childNodes.length; i++) {
+                      patchNode(prev.childNodes[i]);
+                    }
+                  }
+                  if (next) {
+                    patchNode(next);
+                    for (var j = 0; j < next.childNodes.length; j++) {
+                      patchNode(next.childNodes[j]);
+                    }
+                  }
+                }
+              }
+              function runPatch() {
+                try { patchAroundLabels(); } catch (e) {}
+              }
+              runPatch();
+              setTimeout(runPatch, 180);
+              setTimeout(runPatch, 600);
+              if (window.__qauxv_friendclue_observer) {
+                try { window.__qauxv_friendclue_observer.disconnect(); } catch (e2) {}
+              }
+              var timer = null;
+              var observer = new MutationObserver(function() {
+                if (timer) clearTimeout(timer);
+                timer = setTimeout(runPatch, 90);
+              });
+              observer.observe(document.body || document.documentElement, { childList: true, subtree: true, characterData: true });
+              window.__qauxv_friendclue_observer = observer;
+            })();
+        """.trimIndent()
+    }
+
+    private fun evaluateJavascriptOnWebView(webView: Any, script: String) {
+        runCatching {
+            val evalMethod = webView.javaClass.methods.firstOrNull { m ->
+                val p = m.parameterTypes
+                m.name == "evaluateJavascript" && p.size == 2 && p[0] == String::class.java
+            }
+            if (evalMethod != null) {
+                evalMethod.invoke(webView, script, null)
+                return@runCatching
+            }
+            val loadUrlMethod = webView.javaClass.methods.firstOrNull { m ->
+                val p = m.parameterTypes
+                m.name == "loadUrl" && p.size == 1 && p[0] == String::class.java
+            } ?: return@runCatching
+            val compactScript = script
+                .replace("\n", " ")
+                .replace("\r", " ")
+                .replace("\t", " ")
+            loadUrlMethod.invoke(webView, "javascript:$compactScript")
+        }.onFailure { traceError(it) }
+    }
+
+    private fun extractWebViewFromJsBridgeListener(listener: Any): Any? {
+        return runCatching {
+            val weakRefField = listener.javaClass.declaredFields.firstOrNull {
+                java.lang.ref.WeakReference::class.java.isAssignableFrom(it.type)
+            } ?: return@runCatching null
+            weakRefField.isAccessible = true
+            val ref = weakRefField.get(listener) as? java.lang.ref.WeakReference<*>
+            ref?.get()
+        }.getOrNull()
+    }
+
+    private fun getWebViewCurrentUrl(webView: Any?): String? {
+        if (webView == null) return null
+        return runCatching {
+            val method = webView.javaClass.methods.firstOrNull { it.name == "getUrl" && it.parameterTypes.isEmpty() } ?: return@runCatching null
+            method.invoke(webView) as? String
+        }.getOrNull()
+    }
+
+    private fun resolveActivityFromWebView(webView: Any?): Activity? {
+        val context = runCatching {
+            val method = webView?.javaClass?.methods?.firstOrNull { it.name == "getContext" && it.parameterTypes.isEmpty() } ?: return@runCatching null
+            method.invoke(webView) as? Context
+        }.getOrNull()
+        return resolveActivityFromContext(context)
+    }
+
+    private fun resolveActivityFromContext(context: Context?): Activity? {
+        var current = context
+        var depth = 0
+        while (current != null && depth < 8) {
+            if (current is Activity) return current
+            current = if (current is ContextWrapper) current.baseContext else null
+            depth++
+        }
+        return null
+    }
+
+    private fun getIntentExtraKeys(activity: Activity?): List<String> {
+        val extras = activity?.intent?.extras ?: return emptyList()
+        return runCatching {
+            extras.keySet().map { it.trim() }.filter { it.isNotEmpty() }.sorted()
+        }.getOrElse { emptyList() }
     }
 
     private fun replaceFriendTimeText(oldText: String, rule: RuntimeRule): String {
@@ -452,10 +1124,18 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     }
 
     private fun calculateFriendDays(addDateMillis: Long): Int {
-        val today = floorToLocalDay(System.currentTimeMillis())
-        val start = floorToLocalDay(addDateMillis)
-        val diff = ((today - start) / DAY_MILLIS).toInt()
-        return max(1, diff + 1)
+        return runCatching {
+            val zone = ZoneId.systemDefault()
+            val startDate = Instant.ofEpochMilli(addDateMillis).atZone(zone).toLocalDate()
+            val today = LocalDate.now(zone)
+            val diff = ChronoUnit.DAYS.between(startDate, today).toInt()
+            max(1, diff + 1)
+        }.getOrElse {
+            val today = floorToLocalDay(System.currentTimeMillis())
+            val start = floorToLocalDay(addDateMillis)
+            val diff = ((today - start) / DAY_MILLIS).toInt()
+            max(1, diff + 1)
+        }
     }
 
     private fun floorToLocalDay(timeMillis: Long): Long {
