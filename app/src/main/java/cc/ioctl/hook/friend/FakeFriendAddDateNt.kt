@@ -264,7 +264,7 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
             if (dateMatch != null) {
                 return old.replaceRange(dateMatch.range, display)
             }
-            val prefix = prefixRegex.find(old)?.groupValues?.getOrNull(1)?.orEmpty()
+            val prefix = prefixRegex.find(old)?.groupValues?.getOrNull(1).orEmpty()
             if (prefix.isNotEmpty()) {
                 return prefix + display
             }
