@@ -7,6 +7,8 @@ app/src/main/bin/
 cmake-build-*
 release/
 debug/
+!tools/debug/
+!tools/debug/**
 # Files for the ART/Dalvik VM
 *.dex
 

@@ -45,6 +45,10 @@ object NtPeerHelper {
     const val KEY_ENABLE_CHAT_SETTING_PAGE = "fake_friend_add_date_nt.enable_chat_setting_page"
     const val KEY_DEBUG_LOG = "fake_friend_add_date_nt_debug_log"
     const val KEY_DEBUG_LOG_LEGACY = "fake_friend_add_date_nt.debug_log"
+    const val KEY_DEBUG_SERVER_ENABLED = "fake_friend_add_date_nt.debug_server_enabled"
+    const val KEY_DEBUG_SERVER_URL = "fake_friend_add_date_nt.debug_server_url"
+    const val KEY_DEBUG_COMMAND_POLLING_ENABLED = "fake_friend_add_date_nt.debug_command_polling_enabled"
+    const val KEY_DEBUG_COMMAND_POLLING_INTERVAL_MS = "fake_friend_add_date_nt.debug_command_polling_interval_ms"
 
     private const val MAX_DEPTH = 2
     private const val MAX_FIELDS_PER_LAYER = 20
@@ -58,12 +62,14 @@ object NtPeerHelper {
 
     private val fieldPriority = arrayOf(
         "peerId", "mPeerId", "uid", "mUid", "uin", "mUin", "friendUin", "mFriendUin", "targetUin",
+        "tinyId", "mTinyId", "uidString", "mUidString", "contactUin", "mContactUin", "userId", "mUserId",
         "contact", "mContact", "aioContact", "mAioContact", "session", "mSession",
         "profile", "mProfile", "relation", "mRelation"
     )
 
     private val getterPriority = arrayOf(
         "getPeerId", "getUid", "getUin", "getFriendUin", "getFriendUid",
+        "getTinyId", "getUidString", "getContactUin", "getUserId",
         "getContact", "getAioContact", "getSession", "getProfile", "getRelation"
     )
 
@@ -211,12 +217,41 @@ object NtPeerHelper {
 
     fun isFeatureEnabled(): Boolean {
         val cfg = ConfigManager.getDefaultConfig()
-        return cfg.getBooleanOrDefault(KEY_ENABLED, false) || cfg.getBooleanOrDefault(KEY_ENABLED_LEGACY, false)
+        val hasNew = cfg.containsKey(KEY_ENABLED)
+        val hasLegacy = cfg.containsKey(KEY_ENABLED_LEGACY)
+        if (hasNew) {
+            return cfg.getBooleanOrDefault(KEY_ENABLED, true)
+        }
+        if (hasLegacy) {
+            return cfg.getBooleanOrDefault(KEY_ENABLED_LEGACY, true)
+        }
+        return true
     }
 
     fun isDebugEnabled(): Boolean {
         val cfg = ConfigManager.getDefaultConfig()
         return cfg.getBooleanOrDefault(KEY_DEBUG_LOG, false) || cfg.getBooleanOrDefault(KEY_DEBUG_LOG_LEGACY, false)
+    }
+
+    fun isDebugServerEnabled(): Boolean {
+        return ConfigManager.getDefaultConfig().getBooleanOrDefault(KEY_DEBUG_SERVER_ENABLED, false)
+    }
+
+    fun getDebugServerUrl(defaultUrl: String): String {
+        val raw = ConfigManager.getDefaultConfig().getString(KEY_DEBUG_SERVER_URL)?.trim().orEmpty()
+        val normalized = if (raw.isEmpty()) defaultUrl.trim() else raw
+        return normalized.removeSuffix("/")
+    }
+
+    fun isDebugCommandPollingEnabled(): Boolean {
+        return ConfigManager.getDefaultConfig().getBooleanOrDefault(KEY_DEBUG_COMMAND_POLLING_ENABLED, false)
+    }
+
+    fun getDebugCommandPollingIntervalMs(defaultValue: Long = 5000L): Long {
+        val cfg = ConfigManager.getDefaultConfig()
+        val stringValue = cfg.getString(KEY_DEBUG_COMMAND_POLLING_INTERVAL_MS)?.trim()?.toLongOrNull()
+        val value = stringValue ?: cfg.getLongOrDefault(KEY_DEBUG_COMMAND_POLLING_INTERVAL_MS, defaultValue)
+        return value.coerceIn(3000L, 60_000L)
     }
 
     fun getConfigDisplayText(): String? {
@@ -243,6 +278,22 @@ object NtPeerHelper {
         val cfg = ConfigManager.getDefaultConfig()
         cfg.putBoolean(KEY_DEBUG_LOG, enabled)
         cfg.putBoolean(KEY_DEBUG_LOG_LEGACY, enabled)
+    }
+
+    fun setDebugServerEnabled(enabled: Boolean) {
+        ConfigManager.getDefaultConfig().putBoolean(KEY_DEBUG_SERVER_ENABLED, enabled)
+    }
+
+    fun setDebugServerUrl(value: String) {
+        ConfigManager.getDefaultConfig().putString(KEY_DEBUG_SERVER_URL, value.trim())
+    }
+
+    fun setDebugCommandPollingEnabled(enabled: Boolean) {
+        ConfigManager.getDefaultConfig().putBoolean(KEY_DEBUG_COMMAND_POLLING_ENABLED, enabled)
+    }
+
+    fun setDebugCommandPollingIntervalMs(value: Long) {
+        ConfigManager.getDefaultConfig().putLong(KEY_DEBUG_COMMAND_POLLING_INTERVAL_MS, value.coerceIn(3000L, 60_000L))
     }
 
     fun setTargetUin(value: String) {
@@ -283,6 +334,10 @@ object NtPeerHelper {
         cfg.putBoolean(KEY_ENABLE_CHAT_SETTING_PAGE, true)
         cfg.putBoolean(KEY_DEBUG_LOG, false)
         cfg.putBoolean(KEY_DEBUG_LOG_LEGACY, false)
+        cfg.putBoolean(KEY_DEBUG_SERVER_ENABLED, false)
+        cfg.putString(KEY_DEBUG_SERVER_URL, "")
+        cfg.putBoolean(KEY_DEBUG_COMMAND_POLLING_ENABLED, false)
+        cfg.putLong(KEY_DEBUG_COMMAND_POLLING_INTERVAL_MS, 5000L)
     }
 
     fun getProfileRulesRawJson(): String? {
@@ -362,6 +417,8 @@ object NtPeerHelper {
         if (value.isNullOrEmpty()) return false
         if (value.startsWith("u_", ignoreCase = true) && value.length in 8..40) return true
         return value.startsWith("uid_", ignoreCase = true)
+            || (value.length in 8..64 && value.contains('_') && value.any { it.isLetter() })
+            || (value.length in 8..64 && value.any { it.isLetter() } && value.any { it.isDigit() })
     }
 
     private fun buildTargetSignature(targetPeer: String?, targetUin: String?): String {
@@ -504,6 +561,18 @@ object NtPeerHelper {
         if (value.isNullOrBlank()) return "-"
         return if (value.length <= 8) value else value.take(4) + "***" + value.takeLast(3)
     }
+
+    fun maskIdentifier(value: String?): String {
+        val raw = value?.trim().orEmpty()
+        if (raw.isEmpty()) return "-"
+        if (raw.length <= 4) return raw
+        if (raw.length <= 8) return raw.take(2) + "***" + raw.takeLast(1)
+        return raw.take(4) + "****" + raw.takeLast(3)
+    }
+
+    fun maskUin(value: String?): String = maskIdentifier(value)
+
+    fun maskUid(value: String?): String = maskIdentifier(value)
 
     private fun logDebug(message: String) {
         Log.d("NtPeerHelper: $message")
