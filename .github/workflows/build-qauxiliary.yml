@@ -76,41 +76,33 @@ jobs:
 
           cat local.properties
 
-      - name: Prepare signing keystore (secrets or temporary)
+      - name: Prepare temporary signing key
         shell: bash
-        env:
-          SIGN_KEYSTORE_BASE64: ${{ secrets.SIGN_KEYSTORE_BASE64 }}
-          SIGN_KEYSTORE_PASSWORD: ${{ secrets.SIGN_KEYSTORE_PASSWORD }}
-          SIGN_ALIAS: ${{ secrets.SIGN_ALIAS }}
-          SIGN_KEY_PASSWORD: ${{ secrets.SIGN_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          if [[ -n "${SIGN_KEYSTORE_BASE64:-}" && -n "${SIGN_KEYSTORE_PASSWORD:-}" && -n "${SIGN_ALIAS:-}" && -n "${SIGN_KEY_PASSWORD:-}" ]]; then
-            echo "${SIGN_KEYSTORE_BASE64}" | base64 -d > keystore.jks
-            echo "KEYSTORE_PASSWORD=${SIGN_KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS=${SIGN_ALIAS}" >> "$GITHUB_ENV"
-            echo "KEY_PASSWORD=${SIGN_KEY_PASSWORD}" >> "$GITHUB_ENV"
-            echo "SIGNING_MODE=secrets" >> "$GITHUB_ENV"
-          else
-            STORE_PASS="$(openssl rand -hex 16)"
-            KEY_PASS="$(openssl rand -hex 16)"
-            ALIAS_NAME="qauxv_ci"
-            keytool -genkeypair \
-              -alias "${ALIAS_NAME}" \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 36500 \
-              -keystore keystore.jks \
-              -storepass "${STORE_PASS}" \
-              -keypass "${KEY_PASS}" \
-              -dname "CN=QAuxiliary CI,O=QAuxiliary,C=US" \
-              -noprompt
-            echo "KEYSTORE_PASSWORD=${STORE_PASS}" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS=${ALIAS_NAME}" >> "$GITHUB_ENV"
-            echo "KEY_PASSWORD=${KEY_PASS}" >> "$GITHUB_ENV"
-            echo "SIGNING_MODE=temp" >> "$GITHUB_ENV"
-          fi
+
+          rm -f keystore.jks
+
+          keytool -genkeypair \
+            -v \
+            -keystore keystore.jks \
+            -storepass qauxvci123456 \
+            -keypass qauxvci123456 \
+            -alias qauxv_ci \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=QAuxiliary CI,O=Personal,C=CN"
+
           echo "KEYSTORE_PATH=../keystore.jks" >> "$GITHUB_ENV"
+          echo "KEYSTORE_PASSWORD=qauxvci123456" >> "$GITHUB_ENV"
+          echo "KEY_ALIAS=qauxv_ci" >> "$GITHUB_ENV"
+          echo "KEY_PASSWORD=qauxvci123456" >> "$GITHUB_ENV"
+
+          keytool -list \
+            -keystore keystore.jks \
+            -storepass qauxvci123456 \
+            -alias qauxv_ci
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4

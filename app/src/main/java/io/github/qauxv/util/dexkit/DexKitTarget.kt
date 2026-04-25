@@ -1224,3 +1224,24 @@ data object Hd_CustomReportStep_Method : DexKitTarget.UsingStringVector() {
         m.paramCount == 1 && m.parameterTypes.contentEquals(arrayOf(ConcurrentHashMap::class.java))
     }
 }
+
+data object NT_Profile_AddFriendDate_Bind : DexKitTarget.UsingStringVector() {
+    override val findMethod = false
+    override val traitStringVectors = arrayOf(arrayOf("IntimateHeaderCardHolder", "handleCardClick,type="))
+    override val declaringClass = ""
+    override val filter = DexKitFilter.strInClsName("com/tencent/mobileqq/activity/aio/intimate/header/")
+}
+
+data object NT_Profile_RelationInfo_Bind : DexKitTarget.UsingStringVector() {
+    override val findMethod = false
+    override val traitStringVectors = arrayOf(arrayOf("IntimateHeaderSection", "from ", "密友值"))
+    override val declaringClass = ""
+    override val filter = DexKitFilter.allowAll
+}
+
+data object NT_Profile_UnbindAddDate_Bind : DexKitTarget.UsingStringVector() {
+    override val findMethod = false
+    override val traitStringVectors = arrayOf(arrayOf("imate_unbind_become_days)", "ate_unbind_set_type_text)"))
+    override val declaringClass = ""
+    override val filter = DexKitFilter.allowAll
+}
