@@ -31,13 +31,20 @@ import java.lang.reflect.Modifier
 
 object NtPeerHelper {
 
-    const val KEY_ENABLED = "fake_friend_add_date_nt.enabled"
+    const val KEY_ENABLED = "fake_friend_add_date_nt_enabled"
+    const val KEY_ENABLED_LEGACY = "fake_friend_add_date_nt.enabled"
     const val KEY_TARGET_UIN = "fake_friend_add_date_nt.target_uin"
+    const val KEY_TARGET_UID = "fake_friend_add_date_nt.target_uid"
     const val KEY_TARGET_PEER_ID = "fake_friend_add_date_nt.target_peer_id"
+    const val KEY_FAKE_ADD_DATE = "fake_friend_add_date_nt.fake_add_date"
+    const val KEY_FAKE_ADD_TIMESTAMP = "fake_friend_add_date_nt.fake_add_timestamp"
+    const val KEY_NICKNAME = "fake_friend_add_date_nt.nickname"
+    const val KEY_PROFILE_RULES_JSON = "fake_friend_add_date_nt.profile_rules_json"
     const val KEY_DISPLAY_TEXT = "fake_friend_add_date_nt.display_text"
     const val KEY_ENABLE_PROFILE_PAGE = "fake_friend_add_date_nt.enable_profile_page"
     const val KEY_ENABLE_CHAT_SETTING_PAGE = "fake_friend_add_date_nt.enable_chat_setting_page"
-    const val KEY_DEBUG_LOG = "fake_friend_add_date_nt.debug_log"
+    const val KEY_DEBUG_LOG = "fake_friend_add_date_nt_debug_log"
+    const val KEY_DEBUG_LOG_LEGACY = "fake_friend_add_date_nt.debug_log"
 
     private const val MAX_DEPTH = 2
     private const val MAX_FIELDS_PER_LAYER = 20
@@ -170,7 +177,46 @@ object NtPeerHelper {
     }
 
     fun getConfigTargetUin(): String? {
-        return normalizeUin(ConfigManager.getDefaultConfig().getString(KEY_TARGET_UIN))
+        return normalizeUin(
+            ConfigManager.getDefaultConfig().getString(KEY_TARGET_UIN)
+                ?: ConfigManager.getDefaultConfig().getString("fake_friend_add_date_nt.target_uin")
+        )
+    }
+
+    fun getConfigTargetUid(): String? {
+        val cfg = ConfigManager.getDefaultConfig()
+        val raw = cfg.getString(KEY_TARGET_UID)
+            ?: cfg.getString(KEY_TARGET_PEER_ID)
+            ?: cfg.getString("fake_friend_add_date_nt.target_peer_id")
+        return normalizePeerId(raw) ?: raw?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    fun getConfigFakeAddDate(): String? {
+        val cfg = ConfigManager.getDefaultConfig()
+        return cfg.getString(KEY_FAKE_ADD_DATE)?.trim()?.takeIf { it.isNotEmpty() }
+            ?: cfg.getString(KEY_DISPLAY_TEXT)?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    fun getConfigFakeAddTimestamp(): Long? {
+        val cfg = ConfigManager.getDefaultConfig()
+        val raw = cfg.getString(KEY_FAKE_ADD_TIMESTAMP)?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+        val value = raw.toLongOrNull() ?: return null
+        return if (value in 1..4_000_000_000L) value * 1000L else value
+    }
+
+    fun getConfigNickname(): String? {
+        return ConfigManager.getDefaultConfig().getString(KEY_NICKNAME)?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    fun isFeatureEnabled(): Boolean {
+        val cfg = ConfigManager.getDefaultConfig()
+        return cfg.getBooleanOrDefault(KEY_ENABLED, false) || cfg.getBooleanOrDefault(KEY_ENABLED_LEGACY, false)
+    }
+
+    fun isDebugEnabled(): Boolean {
+        val cfg = ConfigManager.getDefaultConfig()
+        return cfg.getBooleanOrDefault(KEY_DEBUG_LOG, false) || cfg.getBooleanOrDefault(KEY_DEBUG_LOG_LEGACY, false)
     }
 
     fun getConfigDisplayText(): String? {
@@ -179,8 +225,69 @@ object NtPeerHelper {
     }
 
     private fun getConfigTargetPeerIdRaw(): String? {
-        val peer = ConfigManager.getDefaultConfig().getString(KEY_TARGET_PEER_ID)?.trim()
-        return peer?.takeIf { it.isNotEmpty() }
+        val cfg = ConfigManager.getDefaultConfig()
+        val peer = cfg.getString(KEY_TARGET_UID)
+            ?: cfg.getString(KEY_TARGET_PEER_ID)
+            ?: cfg.getString("fake_friend_add_date_nt.target_peer_id")
+        val normalized = peer?.trim()
+        return normalized?.takeIf { it.isNotEmpty() }
+    }
+
+    fun setFeatureEnabled(enabled: Boolean) {
+        val cfg = ConfigManager.getDefaultConfig()
+        cfg.putBoolean(KEY_ENABLED, enabled)
+        cfg.putBoolean(KEY_ENABLED_LEGACY, enabled)
+    }
+
+    fun setDebugEnabled(enabled: Boolean) {
+        val cfg = ConfigManager.getDefaultConfig()
+        cfg.putBoolean(KEY_DEBUG_LOG, enabled)
+        cfg.putBoolean(KEY_DEBUG_LOG_LEGACY, enabled)
+    }
+
+    fun setTargetUin(value: String) {
+        ConfigManager.getDefaultConfig().putString(KEY_TARGET_UIN, value.trim())
+    }
+
+    fun setTargetUid(value: String) {
+        val v = value.trim()
+        val cfg = ConfigManager.getDefaultConfig()
+        cfg.putString(KEY_TARGET_UID, v)
+        cfg.putString(KEY_TARGET_PEER_ID, v)
+    }
+
+    fun setFakeAddDate(value: String) {
+        ConfigManager.getDefaultConfig().putString(KEY_FAKE_ADD_DATE, value.trim())
+    }
+
+    fun setFakeAddTimestamp(value: String) {
+        ConfigManager.getDefaultConfig().putString(KEY_FAKE_ADD_TIMESTAMP, value.trim())
+    }
+
+    fun setNickname(value: String) {
+        ConfigManager.getDefaultConfig().putString(KEY_NICKNAME, value.trim())
+    }
+
+    fun clearConfig() {
+        val cfg = ConfigManager.getDefaultConfig()
+        cfg.putBoolean(KEY_ENABLED, false)
+        cfg.putBoolean(KEY_ENABLED_LEGACY, false)
+        cfg.putString(KEY_TARGET_UIN, "")
+        cfg.putString(KEY_TARGET_UID, "")
+        cfg.putString(KEY_TARGET_PEER_ID, "")
+        cfg.putString(KEY_FAKE_ADD_DATE, "")
+        cfg.putString(KEY_FAKE_ADD_TIMESTAMP, "")
+        cfg.putString(KEY_NICKNAME, "")
+        cfg.putString(KEY_DISPLAY_TEXT, "")
+        cfg.putBoolean(KEY_ENABLE_PROFILE_PAGE, true)
+        cfg.putBoolean(KEY_ENABLE_CHAT_SETTING_PAGE, true)
+        cfg.putBoolean(KEY_DEBUG_LOG, false)
+        cfg.putBoolean(KEY_DEBUG_LOG_LEGACY, false)
+    }
+
+    fun getProfileRulesRawJson(): String? {
+        val raw = ConfigManager.getDefaultConfig().getString(KEY_PROFILE_RULES_JSON)?.trim()
+        return raw?.takeIf { it.isNotEmpty() }
     }
 
     private fun normalizeUin(value: String?): String? {
@@ -390,7 +497,7 @@ object NtPeerHelper {
     }
 
     private fun isDebugLogEnabled(): Boolean {
-        return ConfigManager.getDefaultConfig().getBooleanOrDefault(KEY_DEBUG_LOG, false)
+        return isDebugEnabled()
     }
 
     private fun shortValue(value: String?): String {
