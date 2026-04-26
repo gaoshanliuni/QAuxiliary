@@ -50,8 +50,10 @@ import io.github.qauxv.core.HookInstaller
 import io.github.qauxv.dsl.FunctionEntryRouter
 import io.github.qauxv.hook.CommonConfigFunctionHook
 import io.github.qauxv.ui.CommonContextWrapper
+import io.github.qauxv.util.HostInfo
 import io.github.qauxv.util.Initiator
 import io.github.qauxv.util.Log
+import io.github.qauxv.util.SyncUtils
 import io.github.qauxv.util.Toasts
 import io.github.qauxv.util.dexkit.DexKit
 import io.github.qauxv.util.dexkit.DexKitTarget
@@ -78,7 +80,7 @@ import kotlin.math.max
 @UiItemAgentEntry
 object FakeFriendAddDateNt : CommonConfigFunctionHook(
     hookKey = NtPeerHelper.KEY_ENABLED,
-    defaultEnabled = false,
+    defaultEnabled = true,
     targets = arrayOf(
         NT_Profile_AddFriendDate_Bind,
         NT_Profile_RelationInfo_Bind,
@@ -100,6 +102,9 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     )
 
     private const val DAY_MILLIS = 24L * 60 * 60 * 1000
+    private const val DEFAULT_TARGET_UIN = "3394944898"
+    private const val DEFAULT_FAKE_ADD_DATE = "2023-01-02"
+    private const val LOG_TAG = "FakeFriendAddDateNt"
 
     private val dateKeywordList = arrayOf(
         "成为好友", "添加好友", "好友添加", "添加时间", "加好友", "加为好友", "已成为好友", "已绑定", "友谊时间线", "DNA"
@@ -125,7 +130,9 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     }
 
     override fun initOnce(): Boolean {
+        logInitSnapshot("initOnce-enter")
         if (!QAppUtils.isQQnt()) {
+            Log.i("$LOG_TAG: skip init for non-QQNT host")
             return true
         }
         installHeaderModelHook()
@@ -138,6 +145,7 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         installFriendClueWebViewLoadHook()
         installFriendClueJsBridgeHook()
         installFriendCluePageFinishedHook()
+        logInitSnapshot("initOnce-done")
         return true
     }
 
@@ -689,7 +697,7 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
             }
         }
         for (candidate in candidates) {
-            if (NtPeerHelper.isNtTargetPeer(candidate)) {
+            if (isTargetCandidate(candidate)) {
                 return true
             }
         }
@@ -697,25 +705,39 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     }
 
     private fun isTargetByIdentity(uin: String?, uid: String?, peerId: String?): Boolean {
-        if (!peerId.isNullOrBlank() && NtPeerHelper.isNtTargetPeer(peerId)) {
+        val targetUin = getTargetUinOrDefault()
+        val targetUid = getTargetUidOrNull()
+        val targetPeer = getTargetPeerIdOrNull(targetUin, targetUid)
+        val normalizedUin = normalizeUin(uin)
+        val normalizedUid = normalizeUid(uid)
+        val normalizedPeer = NtPeerHelper.normalizePeerId(peerId) ?: NtPeerHelper.normalizePeerId(uid)
+        if (!normalizedUin.isNullOrEmpty() && normalizedUin == targetUin) {
             return true
         }
-        if (!uid.isNullOrBlank() && NtPeerHelper.isNtTargetPeer(uid)) {
+        if (!targetUid.isNullOrEmpty() && !normalizedUid.isNullOrEmpty() &&
+            normalizedUid.equals(targetUid, ignoreCase = true)
+        ) {
             return true
         }
-        val uinRaw = uin?.trim().orEmpty()
-        if (uinRaw.isNotEmpty()) {
-            if (NtPeerHelper.isNtTargetPeer(uinRaw)) {
+        if (!targetPeer.isNullOrEmpty() && !normalizedPeer.isNullOrEmpty() &&
+            normalizedPeer.equals(targetPeer, ignoreCase = true)
+        ) {
+            return true
+        }
+        if (!targetPeer.isNullOrEmpty() && !normalizedUin.isNullOrEmpty()) {
+            val mappedPeer = runCatching {
+                NtPeerHelper.normalizePeerId(QAppUtils.UserUinToPeerID(normalizedUin))
+            }.getOrNull()
+            if (!mappedPeer.isNullOrEmpty() && mappedPeer == targetPeer) {
                 return true
             }
-            val targetPeer = NtPeerHelper.resolveTargetPeerId()
-            if (!targetPeer.isNullOrEmpty()) {
-                val mappedPeer = runCatching {
-                    NtPeerHelper.normalizePeerId(QAppUtils.UserUinToPeerID(uinRaw))
-                }.getOrNull()
-                if (!mappedPeer.isNullOrEmpty() && mappedPeer == targetPeer) {
-                    return true
-                }
+        }
+        if (!targetUid.isNullOrEmpty() && !normalizedPeer.isNullOrEmpty()) {
+            val normalizedTargetUidAsPeer = NtPeerHelper.normalizePeerId(targetUid)
+            if (!normalizedTargetUidAsPeer.isNullOrEmpty() &&
+                normalizedPeer.equals(normalizedTargetUidAsPeer, ignoreCase = true)
+            ) {
+                return true
             }
         }
         return false
@@ -1077,9 +1099,9 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     }
 
     private fun resolveRuntimeRule(): RuntimeRule? {
-        val targetUin = NtPeerHelper.getConfigTargetUin()
-        val targetUid = NtPeerHelper.getConfigTargetUid()
-        if (targetUin.isNullOrEmpty() && targetUid.isNullOrEmpty()) return null
+        val targetUin = getTargetUinOrDefault()
+        val targetUid = getTargetUidOrNull()
+        if (targetUin.isEmpty() && targetUid.isNullOrEmpty()) return null
         val fakeDateMillis = parseConfiguredDateMillis() ?: return null
         val fakeDateText = formatDate(fakeDateMillis)
         val days = calculateFriendDays(fakeDateMillis)
@@ -1094,14 +1116,19 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         NtPeerHelper.getConfigFakeAddTimestamp()?.let {
             return floorToLocalDay(it)
         }
-        val configured = NtPeerHelper.getConfigFakeAddDate() ?: return null
+        val configured = NtPeerHelper.getConfigFakeAddDate()?.trim().orEmpty()
+        val sourceDate = if (configured.isEmpty()) DEFAULT_FAKE_ADD_DATE else configured
         val raw = dateRegex.find(configured)?.value ?: configured.trim()
-        parseDateByFormats(raw)?.let { return floorToLocalDay(it) }
-        return parseMonthDay(raw)
+        parseDateByFormats(raw.ifEmpty { sourceDate })?.let { return floorToLocalDay(it) }
+        parseMonthDay(raw.ifEmpty { sourceDate })?.let { return floorToLocalDay(it) }
+        if (configured.isNotEmpty() && NtPeerHelper.isDebugEnabled()) {
+            Log.w("$LOG_TAG: invalid fake_add_date='$configured', fallback=$DEFAULT_FAKE_ADD_DATE")
+        }
+        return parseDateByFormats(DEFAULT_FAKE_ADD_DATE)?.let { floorToLocalDay(it) }
     }
 
     private fun parseDateByFormats(raw: String): Long? {
-        val patterns = arrayOf("yyyy-MM-dd", "yyyy/MM/dd", "yyyy.MM.dd", "yyyy年M月d日", "yyyy年MM月dd日")
+        val patterns = arrayOf("yyyy-MM-dd", "yyyy-M-d", "yyyy/MM/dd", "yyyy/M/d", "yyyy.MM.dd", "yyyy.M.d", "yyyy年M月d日", "yyyy年MM月dd日")
         for (pattern in patterns) {
             val format = SimpleDateFormat(pattern, Locale.getDefault())
             format.isLenient = false
@@ -1154,7 +1181,7 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
 
     private fun isRuntimeReady(): Boolean {
         if (!QAppUtils.isQQnt()) return false
-        if (!NtPeerHelper.isFeatureEnabled() && !isEnabled) return false
+        if (!isEnabled || !NtPeerHelper.isFeatureEnabled()) return false
         if (resolveRuntimeRule() == null) return false
         return true
     }
@@ -1168,15 +1195,15 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
     }
 
     private fun isTargetContext(thisObj: Any?, vararg args: Any?): Boolean {
-        if (NtPeerHelper.isNtTargetPeer(thisObj)) return true
+        if (isTargetCandidate(thisObj)) return true
         if (thisObj != null) {
             val friendUin = getStringField(thisObj, arrayOf("friendUin", "mFriendUin", "f163493f", "f163405c"))
-            if (NtPeerHelper.isNtTargetPeer(friendUin)) return true
+            if (isTargetByIdentity(friendUin, null, null)) return true
             val friendUid = getStringField(thisObj, arrayOf("friendUid", "mFriendUid", "uid", "mUid", "peerId", "mPeerId"))
-            if (NtPeerHelper.isNtTargetPeer(friendUid)) return true
+            if (isTargetByIdentity(null, friendUid, friendUid)) return true
         }
         for (arg in args) {
-            if (NtPeerHelper.isNtTargetPeer(arg)) return true
+            if (isTargetCandidate(arg)) return true
         }
         return false
     }
@@ -1205,9 +1232,11 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
             val method = clazz.declaredMethods.firstOrNull(checker)
             if (method != null) {
                 method.isAccessible = true
+                debugLog("resolve hook success: ${clazz.name}#${method.name}${method.parameterTypes.joinToString(prefix = "(", postfix = ")") { it.simpleName }}")
                 return method
             }
         }
+        Log.w("$LOG_TAG: resolve hook failed, target=${target?.name ?: "-"}, fallback=${fallbackClassNames.joinToString()}")
         traceError(NoSuchMethodException("No matching method in ${classCandidates.joinToString { it.name }}"))
         return null
     }
@@ -1276,6 +1305,76 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
         }.getOrNull()
     }
 
+    private fun getTargetUinOrDefault(): String {
+        return normalizeUin(NtPeerHelper.getConfigTargetUin()) ?: DEFAULT_TARGET_UIN
+    }
+
+    private fun getTargetUidOrNull(): String? {
+        val raw = NtPeerHelper.getConfigTargetUid()?.trim().orEmpty()
+        return raw.ifEmpty { null }
+    }
+
+    private fun getTargetPeerIdOrNull(targetUin: String = getTargetUinOrDefault(), targetUid: String? = getTargetUidOrNull()): String? {
+        val uidAsPeer = NtPeerHelper.normalizePeerId(targetUid)
+        if (!uidAsPeer.isNullOrEmpty()) return uidAsPeer
+        return runCatching {
+            NtPeerHelper.normalizePeerId(QAppUtils.UserUinToPeerID(targetUin))
+        }.getOrNull()
+    }
+
+    private fun getFakeAddDateOrDefault(): String {
+        val configured = NtPeerHelper.getConfigFakeAddDate()?.trim().orEmpty()
+        if (configured.isEmpty()) return DEFAULT_FAKE_ADD_DATE
+        val raw = dateRegex.find(configured)?.value ?: configured
+        parseDateByFormats(raw)?.let { return formatDate(floorToLocalDay(it)) }
+        parseMonthDay(raw)?.let { return formatDate(floorToLocalDay(it)) }
+        return DEFAULT_FAKE_ADD_DATE
+    }
+
+    private fun normalizeUin(value: String?): String? {
+        val raw = value?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+        return if (raw.all { it.isDigit() }) raw else null
+    }
+
+    private fun normalizeUid(value: String?): String? {
+        val raw = value?.trim().orEmpty()
+        return raw.ifEmpty { null }
+    }
+
+    private fun isTargetCandidate(candidate: Any?): Boolean {
+        if (candidate == null) return false
+        if (candidate is CharSequence) {
+            val value = candidate.toString().trim()
+            return isTargetByIdentity(value, value, value)
+        }
+        val peer = NtPeerHelper.extractPeerIdFromObject(candidate)
+        val uin = NtPeerHelper.extractUinFromObject(candidate)
+        if (isTargetByIdentity(uin, peer, peer)) {
+            return true
+        }
+        val uid = getStringField(candidate, arrayOf("uid", "mUid", "peerId", "mPeerId", "uidString", "mUidString", "userId"))
+        return isTargetByIdentity(uin, uid, peer)
+    }
+
+    private fun logInitSnapshot(stage: String) {
+        val enabledFlag = isEnabled
+        val featureEnabled = NtPeerHelper.isFeatureEnabled()
+        val targetUin = getTargetUinOrDefault()
+        val targetUid = getTargetUidOrNull()
+        val targetPeer = getTargetPeerIdOrNull(targetUin, targetUid)
+        val fakeDate = getFakeAddDateOrDefault()
+        val fakeTs = parseConfiguredDateMillis()
+        val debugEnabled = NtPeerHelper.isDebugEnabled()
+        Log.i(
+            "$LOG_TAG: $stage process=${SyncUtils.getProcessName()} host=${HostInfo.getPackageName()} " +
+                "ver=${HostInfo.getVersionName()}(${HostInfo.getVersionCode32()}) " +
+                "enabled=$enabledFlag featureEnabled=$featureEnabled targetUin=${maskId(targetUin)} " +
+                "targetUid=${maskId(targetUid)} targetPeer=${maskId(targetPeer)} fakeDate=$fakeDate " +
+                "fakeTs=${fakeTs ?: -1L} debug=$debugEnabled"
+        )
+    }
+
     private fun showConfigDialog(activity: Activity) {
         val ctx = CommonContextWrapper.createAppCompatContext(activity)
         val cfg = ConfigManager.getDefaultConfig()
@@ -1288,9 +1387,9 @@ object FakeFriendAddDateNt : CommonConfigFunctionHook(
             text = "启用功能"
             isChecked = NtPeerHelper.isFeatureEnabled() || isEnabled
         }
-        val targetUinEdit = newEditText(ctx, "目标 QQ 号（uin）", NtPeerHelper.getConfigTargetUin().orEmpty())
+        val targetUinEdit = newEditText(ctx, "目标 QQ 号（uin，留空使用默认）", getTargetUinOrDefault())
         val targetUidEdit = newEditText(ctx, "目标 UID/peerId（可选）", NtPeerHelper.getConfigTargetUid().orEmpty())
-        val dateEdit = newEditText(ctx, "伪造加好友日期（如 2020-05-20）", NtPeerHelper.getConfigFakeAddDate().orEmpty())
+        val dateEdit = newEditText(ctx, "伪造加好友日期（如 2020-05-20，留空使用默认）", getFakeAddDateOrDefault())
         val timestampEdit = newEditText(ctx, "伪造时间戳（可空，秒或毫秒）", NtPeerHelper.getConfigFakeAddTimestamp()?.toString().orEmpty())
         val nicknameEdit = newEditText(ctx, "备注昵称（仅模块显示）", NtPeerHelper.getConfigNickname().orEmpty())
         val profileSwitch = SwitchCompat(ctx).apply {
