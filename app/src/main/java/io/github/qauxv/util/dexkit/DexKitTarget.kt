@@ -1234,28 +1234,34 @@ data object NT_Profile_AddFriendDate_Bind : DexKitTarget.UsingStringVector() {
 
 data object NT_Profile_RelationInfo_Bind : DexKitTarget.UsingStringVector() {
     override val findMethod = false
-    override val traitStringVectors = arrayOf(arrayOf("IntimateHeaderSection", "from ", "密友值"))
+    override val traitStringVectors = arrayOf(arrayOf("IntimateHeaderSection", "IntimateFriendInfoSection"))
     override val declaringClass = ""
-    override val filter = DexKitFilter.allowAll
+    override val filter = DexKitFilter.strInClsName("com/tencent/mobileqq/activity/aio/intimate/")
 }
 
 data object NT_Profile_UnbindAddDate_Bind : DexKitTarget.UsingStringVector() {
     override val findMethod = false
-    override val traitStringVectors = arrayOf(arrayOf("imate_unbind_become_days)", "ate_unbind_set_type_text)"))
+    override val traitStringVectors = arrayOf(arrayOf("daysTV", "daysTipTV"))
     override val declaringClass = ""
-    override val filter = DexKitFilter.allowAll
+    override val filter = DexKitFilter.strInClsName("com/tencent/mobileqq/activity/aio/intimate/")
 }
 
 data object NT_Profile_MemoryDay_Helper : DexKitTarget.UsingStringVector() {
     override val findMethod = false
-    override val traitStringVectors = arrayOf(arrayOf("jumph5Url strUrl Empty", "intimate_relationship"))
+    override val traitStringVectors = arrayOf(
+        arrayOf("MemoryDayInfo{date=", "MemoryDayInfo"),
+        arrayOf("jumph5Url strUrl Empty", "intimate_relationship")
+    )
     override val declaringClass = ""
     override val filter = DexKitFilter.strInClsName("com/tencent/mobileqq/activity/aio/intimate/")
 }
 
 data object NT_Profile_NewDna_Adapter : DexKitTarget.UsingStringVector() {
     override val findMethod = false
-    override val traitStringVectors = arrayOf(arrayOf("IntimateContentItemNewDnaView", "em_bas_friend_dna"))
+    override val traitStringVectors = arrayOf(
+        arrayOf("IntimateContentItemNewDnaView"),
+        arrayOf("IntimateContentItemNewDnaView", "em_bas_friend_dna")
+    )
     override val declaringClass = ""
     override val filter = DexKitFilter.strInClsName("com/tencent/mobileqq/activity/aio/intimate/view/")
 }
