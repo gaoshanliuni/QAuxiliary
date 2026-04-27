@@ -13,6 +13,11 @@
 
 QAuxiliary 是一个基于 QNotified 的开源 Xposed 模块
 
+##注意
+不是官方版本，根据我自己的需求做了一些调整。
+
+
+
 ## 使用方法
 
 激活本模块后，在 QQ 或者 TIM 自带设置中点击 QAuxiliary 即可进入设置页面
